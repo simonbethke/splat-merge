@@ -1,0 +1,35 @@
+# --- Rust Standard ---
+# The target directory, where all compilation artifacts are stored
+/target
+
+# --- IDEs and Editors ---
+# JetBrains (IntelliJ, RustRover)
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+# Ignore history files if using the Local History extension
+.history/
+
+# Subversion
+.svn/
+
+# --- Operating System Files ---
+# macOS
+.DS_Store
+# Windows
+Thumbs.db
+desktop.ini
+
+# --- Splat-Merge Specific ---
+# Ignore large point cloud files to prevent repository bloat
+*.ply
+# Ignore potential log files
+*.log
+
+# --- Cargo Lock ---
+# For binary applications (like this tool), it is actually 
+# recommended to commit Cargo.lock to ensure reproducible builds.
+# If you prefer to ignore it, uncomment the line below:
+# Cargo.lock
