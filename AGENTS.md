@@ -27,6 +27,17 @@ Always `--release`: debug builds are unusably slow on real data.
 - Lint: `cargo clippy --all-targets -- -D warnings`
 - Format: `cargo fmt --all`
 
+## Tasks
+- A sequential task queue lives in `tasks/`: one file per pending task
+  (`NN-<name>.md`, ordered by the number prefix) plus `tasks/tasklog.md`.
+- `tasks/tasklog.md` is the source of truth for order and status; the task files
+  hold the full spec for each work item.
+- When asked to implement work, work tasks strictly one at a time in order.
+  Implement only the current task; do not start the next one in the same session.
+- When a task is finished (code done, docs in sync, check/clippy/tests/fmt clean):
+  record the date and time under the task's headline in `tasks/tasklog.md`
+  (moved to "Completed") and delete the task file. Only then may the next task start.
+
 ## Workflow
 1. Read docs, then read the relevant code. Do not guess APIs.
 2. Update docs (see protocol), then make the smallest code change that satisfies them.
