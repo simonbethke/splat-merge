@@ -65,6 +65,32 @@ pub fn parse_ply_header(mmap: &[u8]) -> PlyInfo {
     }
 }
 
+/// Rejects a non-empty file whose binary data section cannot hold the
+/// declared records: zero stride, data length not a multiple of the stride,
+/// or data truncated below the declared vertex count.
+pub fn validate(data: &[u8], info: &PlyInfo) -> Result<(), Box<dyn std::error::Error>> {
+    if info.stride == 0 {
+        return Err("No vertex properties declared in the PLY header".into());
+    }
+    let data_len = data.len().saturating_sub(info.header_len);
+    if !data_len.is_multiple_of(info.stride) {
+        return Err(format!(
+            "Data length {} is not a multiple of the record stride {}",
+            data_len, info.stride
+        )
+        .into());
+    }
+    let actual = data_len / info.stride;
+    if actual < info.vertex_count {
+        return Err(format!(
+            "File holds {} vertex records but the header declares {}",
+            actual, info.vertex_count
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Decodes the first 12 bytes of a record as the little-endian f32 position.
 /// Assumes position is the first property of the file.
 #[inline(always)]

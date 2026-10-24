@@ -2,28 +2,25 @@ mod merge;
 mod pipeline;
 mod ply;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 /// Merge or filter 3D Gaussian Splatting PLY files.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
-enum Mode {
-    Voxel,
-    Scale,
-}
-
 #[derive(Parser)]
 struct Args {
+    /// Comma-separated list of input PLY files; an entry may be `-` (empty).
     #[arg(short = 'i', long)]
-    input1: String,
-    #[arg(short = 'j', long)]
-    input2: String,
+    inputs: String,
+    /// Optional base PLY (final scale step); may be `-` (empty).
+    #[arg(long)]
+    base: Option<String>,
+    /// Output PLY.
     #[arg(short, long)]
     output: String,
-    #[arg(short, long, value_enum, default_value_t = Mode::Voxel)]
-    mode: Mode,
+    /// Cube edge length for the voxel steps.
     #[arg(short, long, default_value_t = 0.5)]
     voxel_size: f32,
-    #[arg(short = 't', long, default_value_t = 0.1)]
+    /// Max-scale threshold for the scale step.
+    #[arg(short = 't', long, default_value_t = 0.01)]
     threshold: f32,
 }
 

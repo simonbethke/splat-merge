@@ -25,22 +25,27 @@ A high-performance Rust utility designed to merge or filter 3D Gaussian Splattin
 ## 🚀 Usage
 
 ### Voxel Mode (Density Merge)
-Combines `file1` and `file2`. For every 0.5 unit cube, it keeps splats only from the file that has more splats in that specific voxel.
+Combines all inputs in a chain, in list order. For every 0.5 unit cube, it keeps splats only from the file that has more splats in that specific voxel.
 ```bash
-cargo run --release -- -i file1.ply -j file2.ply -o merged.ply --mode voxel --voxel-size 0.5
+cargo run --release -- -i file1.ply,file2.ply -o merged.ply
 ```
 
 ### Scale Mode (Size Merge)
-Combines `file1` and `file2`. Uses all splats that are smaller than threshold from file1 and the ones equal or bigger from file2.
+Combines an input with a `--base` file. Uses all splats that are smaller than the threshold (default `0.01`) from the first input and the ones equal or bigger from the base.
 ```bash
-cargo run --release -- -i file1.ply -j file2.ply -o merged.ply --mode scale --threshold 0.01
+cargo run --release -- -i file1.ply --base file2.ply -o merged.ply
 ```
 
 ### Typical workflow
+All detail files can also be merged with the base in a single command:
 ```bash
-cargo run --release -- -i detail_a.ply -j detail_b.ply -o detail_ab.ply --mode voxel --voxel-size 0.5
-cargo run --release -- -i detail_c.ply -j detail_d.ply -o detail_cd.ply --mode voxel --voxel-size 0.5
-cargo run --release -- -i detail_ab.ply -j detail_cd.ply -o detail_abcd.ply --mode voxel --voxel-size 0.5
+cargo run --release -- -i detail_a.ply,detail_b.ply,detail_c.ply,detail_d.ply --base base.ply -o merged.ply
+```
+Or step by step:
+```bash
+cargo run --release -- -i detail_a.ply,detail_b.ply -o detail_ab.ply
+cargo run --release -- -i detail_c.ply,detail_d.ply -o detail_cd.ply
+cargo run --release -- -i detail_ab.ply,detail_cd.ply -o detail_abcd.ply
 
-cargo run --release -- -i detail_abcd.ply -j base.ply -o merged.ply --mode scale --threshold 0.01
+cargo run --release -- -i detail_abcd.ply --base base.ply -o merged.ply
 ```
