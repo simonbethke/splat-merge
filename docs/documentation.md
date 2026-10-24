@@ -58,8 +58,17 @@ cargo run --release -- -i detail_abcd.ply -j base.ply -o merged.ply --mode scale
 ```
 
 ## Architecture
-Single binary, single source file (`src/main.rs`). Dependencies: `clap` (CLI),
-`memmap2` (input mapping), `hashbrown` (voxel density maps).
+Single binary. Dependencies: `clap` (CLI), `memmap2` (input mapping),
+`hashbrown` (voxel density maps).
+
+Source layout:
+- `src/main.rs`: `Mode` + clap-derived `Args`; `main` parses and calls `pipeline::run`.
+- `src/ply.rs`: `PlyInfo` + `parse_ply_header`, `get_pos`, `get_max_scale`, and
+  `rewrite_header` (reconstructed output header).
+- `src/merge.rs`: `MergeMode` (voxel / scale) + `merge_pair` — one pairwise merge,
+  mode-agnostic, writes header then kept records.
+- `src/pipeline.rs`: input mapping (`-` = empty; both empty = error), stride check,
+  mode dispatch, output writing.
 
 Responsibilities by item:
 - `Args`: clap-derived CLI (flags in the "CLI" section).
@@ -101,6 +110,8 @@ related logic.
   intended default.
 
 ## Changelog
+- 2026-10-24 Code split: `src/main.rs` refactored into `main.rs` (CLI), `ply.rs`
+  (format), `merge.rs` (pairwise merge), `pipeline.rs` (run orchestration); behavior unchanged.
 - 2026-10-24 Docs sync: completed "Architecture"; added CLI short flags and defaults
   (`-m` default `voxel`, `-v` default `0.5`, `-t` default `0.1`); recorded voxel-tie
   behavior (file 1 kept), both-`-` input error, and header re-emission rule; marked the
