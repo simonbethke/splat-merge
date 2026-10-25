@@ -1,5 +1,6 @@
 use hashbrown::HashMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ply::{get_max_scale, get_pos, rewrite_header, PlyInfo};
 use crate::progress::Progress;
@@ -26,6 +27,31 @@ pub fn file_weights(sizes: &[usize]) -> Vec<f64> {
     sizes.iter().map(|s| *s as f64 / total as f64).collect()
 }
 
+/// Error returned by a merge step when its cancel flag is set
+/// (the GUI's confirmed Abort).
+#[derive(Debug)]
+pub struct UserAborted;
+
+impl std::fmt::Display for UserAborted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Aborted by user")
+    }
+}
+
+impl std::error::Error for UserAborted {}
+
+/// Checks the shared cancel flag; returns the [`UserAborted`] error when it
+/// is set. Called per record inside the hot loops (a single relaxed atomic
+/// load; no allocation).
+#[inline(always)]
+fn check_cancel(cancel: &AtomicBool) -> Result<(), UserAborted> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(UserAborted)
+    } else {
+        Ok(())
+    }
+}
+
 /// One voxel (density) merge of all (possibly empty) sources in a single
 /// run: one density hashmap per non-empty source, then a per-voxel winner
 /// pass. The winner per voxel is the earliest input (list order) with the
@@ -35,7 +61,8 @@ pub fn file_weights(sizes: &[usize]) -> Vec<f64> {
 /// Writes the reconstructed header (from `header`, rewritten with the
 /// final count) followed by the kept records byte-exact. Progress phases
 /// `1 Mapping` (hashmaps filled) and `2 Merging` (selection and writing),
-/// per the "Progress" documentation section. Returns the number of splats
+/// per the "Progress" documentation section. The `cancel` flag is checked
+/// per record/file (`UserAborted` error). Returns the number of splats
 /// written.
 pub fn merge_voxel(
     sources: &[Option<(&[u8], &PlyInfo)>],
@@ -43,6 +70,7 @@ pub fn merge_voxel(
     header: &str,
     out: &mut impl Write,
     prog: &mut impl Write,
+    cancel: &AtomicBool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let sizes: Vec<usize> = sources
         .iter()
@@ -60,6 +88,7 @@ pub fn merge_voxel(
     for (f, src) in sources.iter().enumerate() {
         if let Some((m, i)) = *src {
             for idx in 0..i.vertex_count {
+                check_cancel(cancel)?;
                 let p = get_pos(&m[i.header_len + idx * i.stride..]);
                 *maps[f].entry(voxel_key(p, voxel_size)).or_insert(0) += 1;
                 prog1.advance(f, 1, prog);
@@ -73,6 +102,7 @@ pub fn merge_voxel(
     let mut winner: HashMap<Key, (usize, usize)> = HashMap::new();
     let mut kept = 0usize;
     for (f, map) in maps.iter().enumerate() {
+        check_cancel(cancel)?;
         for (&v, &c) in map.iter() {
             if winner.get(&v).is_none_or(|(_, wc)| c > *wc) {
                 match winner.insert(v, (f, c)) {
@@ -92,6 +122,7 @@ pub fn merge_voxel(
                 continue;
             }
             for idx in 0..i.vertex_count {
+                check_cancel(cancel)?;
                 if winner
                     .get(&voxel_key(
                         get_pos(&m[i.header_len + idx * i.stride..]),
@@ -132,17 +163,28 @@ fn scale_passes(
 
 /// Counts the splats of `src` passing the keep rule (`below`: `< threshold`,
 /// else `>= threshold`), so the header count is known before streaming.
-fn count_kept(src: Option<(&[u8], &PlyInfo)>, below: bool, threshold: f32) -> usize {
+/// Checks `cancel` per record.
+fn count_kept(
+    src: Option<(&[u8], &PlyInfo)>,
+    below: bool,
+    threshold: f32,
+    cancel: &AtomicBool,
+) -> Result<usize, Box<dyn std::error::Error>> {
     if let Some((m, i)) = src {
         if let Some(off) = i.scale_offset {
-            (0..i.vertex_count)
-                .filter(|&idx| scale_passes(m, i, idx, off, below, threshold))
-                .count()
+            let mut n = 0usize;
+            for idx in 0..i.vertex_count {
+                check_cancel(cancel)?;
+                if scale_passes(m, i, idx, off, below, threshold) {
+                    n += 1;
+                }
+            }
+            Ok(n)
         } else {
-            0
+            Ok(0)
         }
     } else {
-        0
+        Ok(0)
     }
 }
 
@@ -152,8 +194,9 @@ fn count_kept(src: Option<(&[u8], &PlyInfo)>, below: bool, threshold: f32) -> us
 /// present source declares no scale property.
 ///
 /// Writes the reconstructed header followed by the kept records
-/// byte-exact. Progress: only the `2 Merging` phase. Returns the number of
-/// splats written.
+/// byte-exact. Progress: only the `3 Scale` phase. The `cancel` flag is
+/// checked per record (`UserAborted` error). Returns the number of splats
+/// written.
 pub fn merge_scale(
     src1: Option<(&[u8], &PlyInfo)>,
     src2: Option<(&[u8], &PlyInfo)>,
@@ -161,6 +204,7 @@ pub fn merge_scale(
     header: &str,
     out: &mut impl Write,
     prog: &mut impl Write,
+    cancel: &AtomicBool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Absent sources are fine (nothing to validate); present sources must
     // declare a scale property.
@@ -185,15 +229,17 @@ pub fn merge_scale(
         src2.map_or(0, |(_, i)| i.vertex_count),
     ];
 
-    let total = count_kept(src1, true, threshold) + count_kept(src2, false, threshold);
+    let total =
+        count_kept(src1, true, threshold, cancel)? + count_kept(src2, false, threshold, cancel)?;
     rewrite_header(out, header, total)?;
 
-    let mut prog2 = Progress::new("2 Merging", weights, totals.to_vec());
+    let mut prog2 = Progress::new("3 Scale", weights, totals.to_vec());
     for (f, src) in [src1, src2].into_iter().enumerate() {
         if let Some((m, i)) = src {
             if let Some(off) = i.scale_offset {
                 let below = f == 0;
                 for idx in 0..i.vertex_count {
+                    check_cancel(cancel)?;
                     if scale_passes(m, i, idx, off, below, threshold) {
                         let start = i.header_len + idx * i.stride;
                         out.write_all(&m[start..start + i.stride])?;
@@ -279,7 +325,8 @@ mod tests {
             .unwrap_or_default();
         let mut out = Vec::new();
         let mut prog = Vec::new();
-        let n = merge_voxel(&sources, 0.5, &header, &mut out, &mut prog)?;
+        let nc = AtomicBool::new(false);
+        let n = merge_voxel(&sources, 0.5, &header, &mut out, &mut prog, &nc)?;
         Ok((out, n, String::from_utf8_lossy(&prog).into_owned()))
     }
 
@@ -302,6 +349,7 @@ mod tests {
         let mut prog = Vec::new();
         let src1: Option<(&[u8], &PlyInfo)> = Some((&b1[..], &i1));
         let src2: Option<(&[u8], &PlyInfo)> = pair2.as_ref().map(|(b, i)| (b.as_slice(), i));
+        let nc = AtomicBool::new(false);
         let n = merge_scale(
             src1,
             src2,
@@ -309,6 +357,7 @@ mod tests {
             &i1.raw_header,
             &mut out,
             &mut prog,
+            &nc,
         )?;
         Ok((out, n, String::from_utf8_lossy(&prog).into_owned()))
     }
@@ -397,8 +446,8 @@ mod tests {
         let mut expected = a_small;
         expected.extend(b_eq);
         assert_eq!(body_of(&out), expected);
-        // Scale step reports only `2 Merging` (no `1 Mapping` line).
-        assert_eq!(lines, "2 Merging: 100% (0.0M splats)\n");
+        // Scale step reports only `3 Scale` (no `1 Mapping` line).
+        assert_eq!(lines, "3 Scale: 100% (0.0M splats)\n");
     }
 
     #[test]
@@ -408,7 +457,7 @@ mod tests {
         let (out, n, lines) = run_scale(&[a_small.clone(), a_big], None).unwrap();
         assert_eq!(n, 1);
         assert_eq!(body_of(&out), a_small);
-        assert_eq!(lines, "2 Merging: 100% (0.0M splats)\n");
+        assert_eq!(lines, "3 Scale: 100% (0.0M splats)\n");
     }
 
     #[test]
@@ -433,6 +482,7 @@ mod tests {
         let b2 = ply(1, &r2);
         let i2 = parse_ply_header(&b2);
 
+        let nc = AtomicBool::new(false);
         let res = merge_scale(
             Some((&b1, &i1)),
             Some((&b2, &i2)),
@@ -440,8 +490,58 @@ mod tests {
             &i2.raw_header,
             &mut Vec::new(),
             &mut Vec::new(),
+            &nc,
         );
         let err = res.unwrap_err();
         assert_eq!(err.to_string(), "No scale in Input 1");
+    }
+
+    #[test]
+    fn voxel_abort_writes_nothing() {
+        // A pre-set cancel flag must abort before any output byte is written.
+        let a1 = record(0.0, 0.0, 0.0, 0.1);
+        let b1 = record(0.4, 0.3, 0.2, 0.2);
+        let ba = ply(1, &a1);
+        let bb = ply(1, &b1);
+        let ia = parse_ply_header(&ba);
+        let ib = parse_ply_header(&bb);
+        let sources: [Option<(&[u8], &PlyInfo)>; 2] = [Some((&ba[..], &ia)), Some((&bb[..], &ib))];
+        let cancel = AtomicBool::new(true);
+        let mut out = Vec::new();
+        let mut prog = Vec::new();
+        let res = merge_voxel(&sources, 0.5, &ia.raw_header, &mut out, &mut prog, &cancel);
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Aborted by user");
+        assert!(err.downcast_ref::<UserAborted>().is_some());
+        assert!(out.is_empty());
+        assert!(prog.is_empty());
+    }
+
+    #[test]
+    fn scale_abort_writes_nothing() {
+        // A pre-set cancel flag must abort during the count, before any
+        // output byte is written.
+        let a_small = record(0.0, 0.0, 0.0, 0.9);
+        let b_big = record(2.0, 2.0, 2.0, 1.5);
+        let ba = ply(1, &a_small);
+        let bb = ply(1, &b_big);
+        let ia = parse_ply_header(&ba);
+        let ib = parse_ply_header(&bb);
+        let cancel = AtomicBool::new(true);
+        let mut out = Vec::new();
+        let mut prog = Vec::new();
+        let res = merge_scale(
+            Some((&ba[..], &ia)),
+            Some((&bb[..], &ib)),
+            1.0f32.exp(),
+            &ia.raw_header,
+            &mut out,
+            &mut prog,
+            &cancel,
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Aborted by user");
+        assert!(out.is_empty());
+        assert!(prog.is_empty());
     }
 }

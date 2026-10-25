@@ -7,3 +7,5 @@ edition = "2021"
 memmap2 = "0.9"
 clap = { version = "4.0", features = ["derive"] }
 hashbrown = "0.14"
+eframe = "0.37"
+rfd = "0.17"

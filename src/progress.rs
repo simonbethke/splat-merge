@@ -7,7 +7,7 @@ use std::io::Write;
 /// one million, and the phase closes with a single final 100% line.
 /// Line format per the "Progress" documentation section.
 pub struct Progress {
-    /// Task label, e.g. `1 Mapping` or `2 Merging`.
+    /// Task label, e.g. `1 Mapping`, `2 Merging` or `3 Scale`.
     label: String,
     /// Share of the phase's 100% contributed by each file (sums to 1.0 when
     /// any file has a nonzero weight).

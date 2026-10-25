@@ -2,8 +2,9 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
-use crate::merge;
+use crate::merge::{self, UserAborted};
 use crate::ply::{parse_ply_header, rewrite_header, validate, PlyInfo};
 use crate::Args;
 
@@ -117,8 +118,51 @@ fn passthrough(inp: &Input, out: &mut impl Write) -> Result<usize, Box<dyn std::
     Ok(inp.info.vertex_count)
 }
 
-/// Runs the full pipeline described by `args` and writes the output file.
+/// The cancel flag for CLI runs: never set (cancellation is only reachable
+/// through the GUI).
+static NEVER: AtomicBool = AtomicBool::new(false);
+
+/// CLI entry: runs the full pipeline described by `args` and writes the
+/// output file; progress lines and the final `Success:` line go to the
+/// locked stdout.
 pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stdout = std::io::stdout().lock();
+    run_with(args, &mut stdout, &NEVER)
+}
+
+/// Runs the pipeline for `args`, writing progress lines and the final
+/// `Success:` line to `out`. On a user abort it removes the partially
+/// written output file, streams the documented abort line to the sink
+/// (temp files are removed by their guard on every path), and returns the
+/// `UserAborted` error; other errors leave the output file in place.
+pub fn run_with(
+    args: &Args,
+    out: &mut impl Write,
+    cancel: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match run_steps(args, out, cancel) {
+        Ok(n) => {
+            writeln!(out, "Success: {} splats saved to {}", n, args.output)?;
+            Ok(())
+        }
+        Err(e) => {
+            if e.downcast_ref::<UserAborted>().is_some() {
+                remove_quiet(Path::new(&args.output));
+                // A failed sink write must not shadow the abort error.
+                let _ = writeln!(out, "Aborted; temporary and partial output files removed.");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The pipeline body (see the "Pipeline" section); progress lines go to
+/// `prog`. Returns the number of splats written to the output file.
+fn run_steps(
+    args: &Args,
+    prog: &mut impl Write,
+    cancel: &AtomicBool,
+) -> Result<usize, Box<dyn std::error::Error>> {
     // 1. Parse the comma-separated input list.
     let names: Vec<&str> = args.inputs.split(',').map(str::trim).collect();
     if names.iter().any(|n| n.is_empty()) {
@@ -142,9 +186,6 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let (temp1, temp2) = temp_paths(&args.output)?;
     let _temp_guard = TempGuard::new(temp1.clone(), temp2);
     let mut writer = BufWriter::new(File::create(&args.output)?);
-    // Locked stdout for progress lines; released before the `Success:` line
-    // so printing cannot deadlock against itself.
-    let mut stdout = std::io::stdout().lock();
 
     let n: usize = if inputs.len() >= 2 {
         // 4a. Two or more inputs: one voxel step over the whole list.
@@ -158,7 +199,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.voxel_size,
                 &header,
                 &mut temp_writer,
-                &mut stdout,
+                prog,
+                cancel,
             )?;
             temp_writer.flush()?;
             drop(temp_writer);
@@ -170,10 +212,18 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.threshold,
                 &header,
                 &mut writer,
-                &mut stdout,
+                prog,
+                cancel,
             )?
         } else {
-            merge::merge_voxel(&sources, args.voxel_size, &header, &mut writer, &mut stdout)?
+            merge::merge_voxel(
+                &sources,
+                args.voxel_size,
+                &header,
+                &mut writer,
+                prog,
+                cancel,
+            )?
         }
     } else {
         // 4c. Single input slot.
@@ -189,7 +239,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 args.threshold,
                 &header,
                 &mut writer,
-                &mut stdout,
+                prog,
+                cancel,
             )?
         } else {
             // Single input, no base: passthrough copy (no progress lines).
@@ -199,10 +250,8 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    drop(stdout);
     writer.flush()?;
-    println!("Success: {} splats saved to {}", n, args.output);
-    Ok(())
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -517,5 +566,43 @@ mod tests {
         assert!(run(&args(&format!("{},{}", a, b), Some(&base), &out)).is_err());
         assert!(!dir.path("merged.temp1.ply").exists());
         assert!(!dir.path("merged.temp2.ply").exists());
+    }
+
+    #[test]
+    fn aborted_run_removes_temp_and_output_and_reports() {
+        let dir = TmpDir::new("abort");
+        let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.5)]);
+        let b = write_ply(&dir, "b.ply", &[record(5.0, 5.0, 5.0, 0.8)]);
+        let base = write_ply(&dir, "base.ply", &[record(2.0, 0.0, 5.0, 1.6)]);
+        let out = dir.path("merged.ply");
+        let cancel = AtomicBool::new(true);
+        let mut sink: Vec<u8> = Vec::new();
+        let res = run_with(
+            &args(&format!("{},{}", a, b), Some(&base), &out),
+            &mut sink,
+            &cancel,
+        );
+        let err = res.unwrap_err();
+        assert_eq!(err.to_string(), "Aborted by user");
+        assert!(err.downcast_ref::<UserAborted>().is_some());
+        assert!(!dir.path("merged.temp1.ply").exists());
+        assert!(!dir.path("merged.temp2.ply").exists());
+        assert!(!out.exists());
+        let log = String::from_utf8(sink).unwrap();
+        assert!(log.contains("Aborted; temporary and partial output files removed."));
+        assert!(!log.contains("Success:"));
+    }
+
+    #[test]
+    fn run_with_success_line_goes_to_sink() {
+        let dir = TmpDir::new("sink");
+        let recs = vec![record(0.0, 0.0, 0.0, 0.1), record(9.0, 9.0, 9.0, 0.2)];
+        let a = write_ply(&dir, "a.ply", &recs);
+        let out = dir.path("out.ply");
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(&args(&a, None, &out), &mut sink, &NEVER).unwrap();
+        let log = String::from_utf8(sink).unwrap();
+        let expected = format!("Success: 2 splats saved to {}\n", out.to_string_lossy());
+        assert!(log.contains(&expected));
     }
 }

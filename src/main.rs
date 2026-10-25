@@ -1,3 +1,4 @@
+mod gui;
 mod merge;
 mod pipeline;
 mod ply;
@@ -26,6 +27,12 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    pipeline::run(&args)
+    // No arguments: the GUI front end (see the "Invocation" section of the
+    // documentation); otherwise CLI mode.
+    if std::env::args().count() == 1 {
+        gui::launch()
+    } else {
+        let args = Args::parse();
+        pipeline::run(&args)
+    }
 }
