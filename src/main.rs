@@ -3,6 +3,7 @@
 #![windows_subsystem = "windows"]
 
 mod gui;
+mod logfile;
 mod merge;
 mod pipeline;
 mod ply;

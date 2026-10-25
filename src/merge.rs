@@ -1,7 +1,9 @@
 use hashbrown::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
+use crate::logfile::{format_duration, format_splats};
 use crate::ply::{get_max_scale, get_pos, rewrite_header, PlyInfo};
 use crate::progress::Progress;
 
@@ -60,16 +62,18 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), UserAborted> {
 ///
 /// Writes the reconstructed header (from `header`, rewritten with the
 /// final count) followed by the kept records byte-exact. Progress phases
-/// `1 Mapping` (hashmaps filled) and `2 Merging` (selection and writing),
-/// per the "Progress" documentation section. The `cancel` flag is checked
-/// per record/file (`UserAborted` error). Returns the number of splats
-/// written.
+/// `1 Mapping` (hashmaps filled) and `2 Merging (voxel based)` (selection and writing),
+/// per the "Progress" documentation section; the phase start/finish
+/// detail lines (with durations) go to `log`, per the "Run log" section.
+/// The `cancel` flag is checked per record/file (`UserAborted` error).
+/// Returns the number of splats written.
 pub fn merge_voxel(
     sources: &[Option<(&[u8], &PlyInfo)>],
     voxel_size: f32,
     header: &str,
     out: &mut impl Write,
     prog: &mut impl Write,
+    log: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let sizes: Vec<usize> = sources
@@ -83,6 +87,8 @@ pub fn merge_voxel(
         .collect();
 
     // `1 Mapping`: fill one density hashmap per source.
+    let _ = writeln!(log, "1 Mapping started");
+    let t1 = Instant::now();
     let mut maps: Vec<HashMap<Key, usize>> = sources.iter().map(|_| HashMap::new()).collect();
     let mut prog1 = Progress::new("1 Mapping", weights.clone(), totals.clone());
     for (f, src) in sources.iter().enumerate() {
@@ -96,6 +102,16 @@ pub fn merge_voxel(
         }
     }
     prog1.finish(prog);
+    let _ = writeln!(
+        log,
+        "1 Mapping finished after {}",
+        format_duration(t1.elapsed().as_secs())
+    );
+
+    // `2 Merging`: selection and copy of the winning records in input-list
+    // order (this phase's duration covers both passes).
+    let _ = writeln!(log, "2 Merging (voxel based) started");
+    let t2 = Instant::now();
 
     // Per-voxel winner: max count, ties keep the earliest input, so files
     // processed in order only replace the winner on a strictly higher count.
@@ -113,8 +129,7 @@ pub fn merge_voxel(
         }
     }
 
-    // `2 Merging`: copy the winning records in input-list order.
-    let mut prog2 = Progress::new("2 Merging", weights, totals);
+    let mut prog2 = Progress::new("2 Merging (voxel based)", weights, totals);
     rewrite_header(out, header, kept)?;
     for (f, src) in sources.iter().enumerate() {
         if let Some((m, i)) = *src {
@@ -138,6 +153,12 @@ pub fn merge_voxel(
         }
     }
     prog2.finish(prog);
+    let _ = writeln!(
+        log,
+        "2 Merging (voxel based) finished after {} ({} kept)",
+        format_duration(t2.elapsed().as_secs()),
+        format_splats(kept)
+    );
     Ok(kept)
 }
 
@@ -194,9 +215,14 @@ fn count_kept(
 /// present source declares no scale property.
 ///
 /// Writes the reconstructed header followed by the kept records
-/// byte-exact. Progress: only the `3 Scale` phase. The `cancel` flag is
+/// byte-exact. Progress: only the `3 Cleaning (scale based)` phase; the
+/// phase detail lines (counting marker, kept count, duration) go to `log`,
+/// per the "Run log" documentation section. The `cancel` flag is
 /// checked per record (`UserAborted` error). Returns the number of splats
 /// written.
+// Two sources + threshold + header + out/prog/log sinks + cancel make 8
+// parameters; a struct would obscure a positional-only call site.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_scale(
     src1: Option<(&[u8], &PlyInfo)>,
     src2: Option<(&[u8], &PlyInfo)>,
@@ -204,6 +230,7 @@ pub fn merge_scale(
     header: &str,
     out: &mut impl Write,
     prog: &mut impl Write,
+    log: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Absent sources are fine (nothing to validate); present sources must
@@ -229,11 +256,21 @@ pub fn merge_scale(
         src2.map_or(0, |(_, i)| i.vertex_count),
     ];
 
+    // Count pass (the log marks it; the started line carries the result).
+    let _ = writeln!(log, "3 Cleaning (scale based): counting kept splats");
     let total =
         count_kept(src1, true, threshold, cancel)? + count_kept(src2, false, threshold, cancel)?;
+    let all = totals[0] + totals[1];
+    let _ = writeln!(
+        log,
+        "3 Cleaning (scale based) started ({} of {} splats kept)",
+        format_splats(total),
+        format_splats(all)
+    );
+    let t2 = Instant::now();
     rewrite_header(out, header, total)?;
 
-    let mut prog2 = Progress::new("3 Scale", weights, totals.to_vec());
+    let mut prog2 = Progress::new("3 Cleaning (scale based)", weights, totals.to_vec());
     for (f, src) in [src1, src2].into_iter().enumerate() {
         if let Some((m, i)) = src {
             if let Some(off) = i.scale_offset {
@@ -250,6 +287,11 @@ pub fn merge_scale(
         }
     }
     prog2.finish(prog);
+    let _ = writeln!(
+        log,
+        "3 Cleaning (scale based) finished after {}",
+        format_duration(t2.elapsed().as_secs())
+    );
     Ok(total)
 }
 
@@ -293,12 +335,13 @@ mod tests {
         out[i.header_len..].to_vec()
     }
 
+    /// The result of the `run_voxel` / `run_scale` helpers.
+    type RunOut = Result<(Vec<u8>, usize, String, String), Box<dyn std::error::Error>>;
+
     /// Runs one voxel merge over in-memory files (`None` = empty slot) with
-    /// 11-float records; returns output bytes, splat count, and the progress
-    /// lines in order.
-    fn run_voxel(
-        files: &[Option<Vec<Vec<u8>>>],
-    ) -> Result<(Vec<u8>, usize, String), Box<dyn std::error::Error>> {
+    /// 11-float records; returns output bytes, splat count, the progress
+    /// lines in order, and the run-log lines in order.
+    fn run_voxel(files: &[Option<Vec<Vec<u8>>>]) -> RunOut {
         // Build (buffer, info) pairs in file order; empty slots stay `None`
         // in `sources`, aligned 1:1 with `files`.
         let mut pairs: Vec<(Vec<u8>, PlyInfo)> = Vec::new();
@@ -325,17 +368,21 @@ mod tests {
             .unwrap_or_default();
         let mut out = Vec::new();
         let mut prog = Vec::new();
+        let mut log = Vec::new();
         let nc = AtomicBool::new(false);
-        let n = merge_voxel(&sources, 0.5, &header, &mut out, &mut prog, &nc)?;
-        Ok((out, n, String::from_utf8_lossy(&prog).into_owned()))
+        let n = merge_voxel(&sources, 0.5, &header, &mut out, &mut prog, &mut log, &nc)?;
+        Ok((
+            out,
+            n,
+            String::from_utf8_lossy(&prog).into_owned(),
+            String::from_utf8_lossy(&log).into_owned(),
+        ))
     }
 
     /// Runs one scale merge over in-memory files; returns output bytes,
-    /// splat count, and the progress lines in order.
-    fn run_scale(
-        recs1: &[Vec<u8>],
-        recs2: Option<&[Vec<u8>]>,
-    ) -> Result<(Vec<u8>, usize, String), Box<dyn std::error::Error>> {
+    /// splat count, the progress lines in order, and the run-log lines in
+    /// order.
+    fn run_scale(recs1: &[Vec<u8>], recs2: Option<&[Vec<u8>]>) -> RunOut {
         let body1: Vec<u8> = recs1.iter().flatten().copied().collect();
         let b1 = ply(recs1.len(), &body1);
         let i1 = parse_ply_header(&b1);
@@ -347,6 +394,7 @@ mod tests {
         });
         let mut out = Vec::new();
         let mut prog = Vec::new();
+        let mut log = Vec::new();
         let src1: Option<(&[u8], &PlyInfo)> = Some((&b1[..], &i1));
         let src2: Option<(&[u8], &PlyInfo)> = pair2.as_ref().map(|(b, i)| (b.as_slice(), i));
         let nc = AtomicBool::new(false);
@@ -357,22 +405,39 @@ mod tests {
             &i1.raw_header,
             &mut out,
             &mut prog,
+            &mut log,
             &nc,
         )?;
-        Ok((out, n, String::from_utf8_lossy(&prog).into_owned()))
+        Ok((
+            out,
+            n,
+            String::from_utf8_lossy(&prog).into_owned(),
+            String::from_utf8_lossy(&log).into_owned(),
+        ))
     }
 
     #[test]
     fn voxel_tie_keeps_earliest_file() {
         let a1 = record(0.0, 0.0, 0.0, 0.1);
         let b1 = record(0.4, 0.3, 0.2, 0.2); // same voxel (0,0,0) as a1
-        let (out, n, lines) = run_voxel(&[Some(vec![a1.clone()]), Some(vec![b1])]).unwrap();
+        let (out, n, lines, log) = run_voxel(&[Some(vec![a1.clone()]), Some(vec![b1])]).unwrap();
         assert_eq!(n, 1);
         assert_eq!(body_of(&out), a1);
         assert_eq!(
             lines,
-            "1 Mapping: 100% (0.0M splats)\n2 Merging: 100% (0.0M splats)\n"
+            "1 Mapping: 100% (0.0M splats)\n2 Merging (voxel based): 100% (0.0M splats)\n"
         );
+        // Progress lines only: no detail lines leak into the progress sink.
+        assert!(!lines.contains("started") && !lines.contains("finished"));
+        // Log carries the phase sequence with durations and the kept count,
+        // but no progress lines.
+        assert_eq!(
+            log,
+            "1 Mapping started\n1 Mapping finished after 0s\n\
+             2 Merging (voxel based) started\n\
+             2 Merging (voxel based) finished after 0s (1 kept)\n"
+        );
+        assert!(!log.contains('%'));
     }
 
     #[test]
@@ -381,7 +446,8 @@ mod tests {
         let a1 = record(-5.4, -5.3, -5.2, 0.1);
         let a2 = record(-5.1, -5.2, -5.4, 0.2);
         let b1 = record(-5.45, -5.45, -5.45, 0.3);
-        let (out, n, _) = run_voxel(&[Some(vec![a1.clone(), a2.clone()]), Some(vec![b1])]).unwrap();
+        let (out, n, _, _) =
+            run_voxel(&[Some(vec![a1.clone(), a2.clone()]), Some(vec![b1])]).unwrap();
         assert_eq!(n, 2);
         let mut expected = a1;
         expected.extend(a2);
@@ -395,7 +461,7 @@ mod tests {
         let b1 = record(0.1, 0.1, 0.1, 0.2);
         let b2 = record(0.2, 0.0, 0.0, 0.3);
         let c1 = record(5.0, 5.0, 5.0, 0.4);
-        let (out, n, _) = run_voxel(&[
+        let (out, n, _, _) = run_voxel(&[
             Some(vec![a1]),
             Some(vec![b1.clone(), b2.clone()]),
             Some(vec![c1.clone()]),
@@ -413,12 +479,12 @@ mod tests {
         // A present-but-empty file still gets a byte-size weight; its zero
         // splats count as fully processed, so both phases close at 100%.
         let a1 = record(0.0, 0.0, 0.0, 0.1);
-        let (out, n, lines) = run_voxel(&[Some(vec![]), Some(vec![a1.clone()])]).unwrap();
+        let (out, n, lines, _) = run_voxel(&[Some(vec![]), Some(vec![a1.clone()])]).unwrap();
         assert_eq!(n, 1);
         assert_eq!(body_of(&out), a1);
         assert_eq!(
             lines,
-            "1 Mapping: 100% (0.0M splats)\n2 Merging: 100% (0.0M splats)\n"
+            "1 Mapping: 100% (0.0M splats)\n2 Merging (voxel based): 100% (0.0M splats)\n"
         );
     }
 
@@ -427,7 +493,7 @@ mod tests {
         let a1 = record(0.0, 0.0, 0.0, 0.1);
         let a2 = record(9.0, 9.0, 9.0, 0.2);
         let b1 = record(0.4, 0.2, 0.1, 0.3); // same voxel (0,0,0) as a1
-        let (out, n, _) = run_voxel(&[Some(vec![a1, a2]), Some(vec![b1])]).unwrap();
+        let (out, n, _, _) = run_voxel(&[Some(vec![a1, a2]), Some(vec![b1])]).unwrap();
         assert_eq!(n, 2);
         let info = parse_ply_header(&out);
         assert_eq!(info.vertex_count, n);
@@ -440,24 +506,35 @@ mod tests {
         let a_eq = record(1.0, 0.0, 0.0, 1.0); // exp(1.0) == e -> file 1 drops
         let b_eq = record(2.0, 0.0, 0.0, 1.0); // exp(1.0) == e -> file 2 keeps
         let b_small = record(3.0, 0.0, 0.0, 0.9); // exp(0.9) < e -> file 2 drops
-        let (out, n, lines) =
+        let (out, n, lines, log) =
             run_scale(&[a_small.clone(), a_eq], Some(&[b_eq.clone(), b_small])).unwrap();
         assert_eq!(n, 2);
         let mut expected = a_small;
         expected.extend(b_eq);
         assert_eq!(body_of(&out), expected);
-        // Scale step reports only `3 Scale` (no `1 Mapping` line).
-        assert_eq!(lines, "3 Scale: 100% (0.0M splats)\n");
+        // Scale step reports only `3 Cleaning (scale based)` (no `1 Mapping` line).
+        assert_eq!(lines, "3 Cleaning (scale based): 100% (0.0M splats)\n");
+        // Log: counting marker, kept-count started line, duration — and no
+        // progress lines.
+        assert_eq!(
+            log,
+            "3 Cleaning (scale based): counting kept splats\n\
+             3 Cleaning (scale based) started (2 of 4 splats kept)\n\
+             3 Cleaning (scale based) finished after 0s\n"
+        );
+        assert!(!log.contains('%'));
     }
 
     #[test]
     fn scale_empty_file2() {
         let a_small = record(0.0, 0.0, 0.0, 0.9);
         let a_big = record(1.5, 1.5, 1.5, 1.5);
-        let (out, n, lines) = run_scale(&[a_small.clone(), a_big], None).unwrap();
+        let (out, n, lines, log) = run_scale(&[a_small.clone(), a_big], None).unwrap();
         assert_eq!(n, 1);
         assert_eq!(body_of(&out), a_small);
-        assert_eq!(lines, "3 Scale: 100% (0.0M splats)\n");
+        assert_eq!(lines, "3 Cleaning (scale based): 100% (0.0M splats)\n");
+        assert!(log.contains("3 Cleaning (scale based) started (1 of 2 splats kept)"));
+        assert!(!log.contains('%'));
     }
 
     #[test]
@@ -490,6 +567,7 @@ mod tests {
             &i2.raw_header,
             &mut Vec::new(),
             &mut Vec::new(),
+            &mut Vec::new(),
             &nc,
         );
         let err = res.unwrap_err();
@@ -509,12 +587,25 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let mut out = Vec::new();
         let mut prog = Vec::new();
-        let res = merge_voxel(&sources, 0.5, &ia.raw_header, &mut out, &mut prog, &cancel);
+        let mut log = Vec::new();
+        let res = merge_voxel(
+            &sources,
+            0.5,
+            &ia.raw_header,
+            &mut out,
+            &mut prog,
+            &mut log,
+            &cancel,
+        );
         let err = res.unwrap_err();
         assert_eq!(err.to_string(), "Aborted by user");
         assert!(err.downcast_ref::<UserAborted>().is_some());
         assert!(out.is_empty());
         assert!(prog.is_empty());
+        // The `1 Mapping started` line is logged before the first record check.
+        let logtext = String::from_utf8(log).unwrap();
+        assert!(logtext.contains("1 Mapping started"));
+        assert!(!logtext.contains("1 Mapping finished"));
     }
 
     #[test]
@@ -530,6 +621,7 @@ mod tests {
         let cancel = AtomicBool::new(true);
         let mut out = Vec::new();
         let mut prog = Vec::new();
+        let mut log = Vec::new();
         let res = merge_scale(
             Some((&ba[..], &ia)),
             Some((&bb[..], &ib)),
@@ -537,11 +629,17 @@ mod tests {
             &ia.raw_header,
             &mut out,
             &mut prog,
+            &mut log,
             &cancel,
         );
         let err = res.unwrap_err();
         assert_eq!(err.to_string(), "Aborted by user");
         assert!(out.is_empty());
         assert!(prog.is_empty());
+        // The counting marker is logged before the first record check; the
+        // started line (which carries the kept count) never comes.
+        let logtext = String::from_utf8(log).unwrap();
+        assert!(logtext.contains("counting kept splats"));
+        assert!(!logtext.contains("started"));
     }
 }

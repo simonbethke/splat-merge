@@ -19,7 +19,7 @@ A high-performance Rust utility designed to merge or filter 3D Gaussian Splattin
 * **Memory Efficiency**: Uses `memmap2` to interface with large files without loading them entirely into RAM.
 * **Voxel Density Merge**: Merges all files in the input list in a single pass by comparing splat density within a grid; per cube, only the splats from the densest file are kept (ties go to the earliest input).
 * **Scale Thresholding**: Splits or filters splats based on their maximum dimension (world-space scale), derived from the exponential of the logged scale properties.
-* **Progress**: Prints `1 Mapping` and `2 Merging` progress lines to stdout while merging.
+* **Progress**: Prints `1 Mapping`, `2 Merging (voxel based)`, and `3 Cleaning (scale based)` progress lines to stdout.
 * **Null-Input Support**: Uses `-` as a filename to treat an input slot as empty.
 * **Binary Accuracy**: Surgically reconstructs PLY headers and preserves the exact binary stride of Gaussian Splat properties (SH, rotation, scale, etc.).
 
@@ -50,3 +50,6 @@ cargo run --release -- -i detail_ab.ply,detail_cd.ply -o detail_abcd.ply
 
 cargo run --release -- -i detail_abcd.ply --base base.ply -o merged.ply
 ```
+
+### GUI (no arguments)
+Running without arguments opens a small window: add input files (button or drag & drop), optionally set the base file and scale threshold, pick an output file, then press **Run**. Progress shows as a table with one bar each for Mapping, Merging, and Cleaning (percentage inside each bar); everything else — rejected files, validation errors, the final result — appears as native message dialogs.

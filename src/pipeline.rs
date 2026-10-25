@@ -3,7 +3,9 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
+use crate::logfile::{format_bytes, format_duration, format_splats, LogFile};
 use crate::merge::{self, UserAborted};
 use crate::ply::{parse_ply_header, rewrite_header, validate, PlyInfo};
 use crate::Args;
@@ -111,6 +113,60 @@ fn error_msg(msg: &str) -> Box<dyn std::error::Error> {
     Box::<dyn std::error::Error>::from(msg.to_string())
 }
 
+/// The run log sink for one run: either the real log file beside the
+/// executable, or nothing at all (writes are accepted and dropped) when
+/// the output is the log file itself.
+enum LogSink {
+    /// The log file; every line passes through.
+    File(LogFile),
+    /// No log file; accepted writes are dropped.
+    Null,
+}
+
+impl Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LogSink::File(lf) => lf.write(buf),
+            LogSink::Null => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            LogSink::File(lf) => lf.flush(),
+            LogSink::Null => Ok(()),
+        }
+    }
+}
+
+/// The run log path: `splat-merge.log` beside the executable file,
+/// per the "Run log" documentation section.
+fn log_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| error_msg(&format!("Cannot locate the executable: {e}")))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| error_msg("Executable path has no parent directory"))?;
+    Ok(dir.join("splat-merge.log"))
+}
+
+/// True when `output` names the same file as the run log (case-insensitive;
+/// writing the log would then truncate the output, and vice versa). A
+/// relative `output` is resolved against the current directory.
+fn output_is_the_log(output: &str, log: &Path) -> bool {
+    let out = Path::new(output);
+    let resolved = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|dir| dir.join(out))
+            .unwrap_or_else(|_| out.to_path_buf())
+    };
+    resolved
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&log.to_string_lossy())
+}
+
 /// Copies a single input to `out` verbatim (passthrough), count unchanged.
 fn passthrough(inp: &Input, out: &mut impl Write) -> Result<usize, Box<dyn std::error::Error>> {
     rewrite_header(out, &inp.info.raw_header, inp.info.vertex_count)?;
@@ -131,25 +187,76 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Runs the pipeline for `args`, writing progress lines and the final
-/// `Success:` line to `out`. On a user abort it removes the partially
-/// written output file, streams the documented abort line to the sink
-/// (temp files are removed by their guard on every path), and returns the
-/// `UserAborted` error; other errors leave the output file in place.
+/// `Success:` line to `out`. Regardless of the sink, a run log file is
+/// created (truncating) as `splat-merge.log` beside the executable, per
+/// the "Run log" documentation section: it is skipped only when the output
+/// is that same log file. It receives the `Run started` line, the
+/// input/base lines, the step/phase detail lines, and a terminal
+/// `Run finished` / `Run aborted` / `Run failed` line, which is written
+/// before the sink's `Success:`/abort line. On a user abort the partially
+/// written output file is removed (temp files by their guard); the log is
+/// kept in every case. A failure to locate the executable or to create the
+/// log file is a run error.
 pub fn run_with(
     args: &Args,
     out: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match run_steps(args, out, cancel) {
+    let started = Instant::now();
+    let logp = log_path()?;
+    let mut log = if output_is_the_log(&args.output, &logp) {
+        LogSink::Null
+    } else {
+        LogSink::File(LogFile::new(&logp)?)
+    };
+    let inputs = args
+        .inputs
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let _ = writeln!(
+        log,
+        "Run started (inputs: {}; base: {}; output: {}; voxel size: {}; threshold: {})",
+        inputs,
+        args.base.as_deref().unwrap_or("-"),
+        args.output,
+        args.voxel_size,
+        args.threshold
+    );
+    match run_steps(args, out, &mut log, cancel) {
         Ok(n) => {
+            let size = std::fs::metadata(&args.output)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let _ = writeln!(
+                log,
+                "Run finished: {} splats written to {} ({}) in {}",
+                format_splats(n),
+                args.output,
+                format_bytes(size),
+                format_duration(started.elapsed().as_secs())
+            );
             writeln!(out, "Success: {} splats saved to {}", n, args.output)?;
             Ok(())
         }
         Err(e) => {
             if e.downcast_ref::<UserAborted>().is_some() {
                 remove_quiet(Path::new(&args.output));
+                let _ = writeln!(
+                    log,
+                    "Run aborted after {}",
+                    format_duration(started.elapsed().as_secs())
+                );
                 // A failed sink write must not shadow the abort error.
                 let _ = writeln!(out, "Aborted; temporary and partial output files removed.");
+            } else {
+                let _ = writeln!(
+                    log,
+                    "Run failed after {}: {}",
+                    format_duration(started.elapsed().as_secs()),
+                    e
+                );
             }
             Err(e)
         }
@@ -157,10 +264,13 @@ pub fn run_with(
 }
 
 /// The pipeline body (see the "Pipeline" section); progress lines go to
-/// `prog`. Returns the number of splats written to the output file.
+/// `prog`, run-log detail lines (input/base lines, step markers) to
+/// `log` (see the "Run log" section). Returns the number of splats
+/// written to the output file.
 fn run_steps(
     args: &Args,
     prog: &mut impl Write,
+    log: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // 1. Parse the comma-separated input list.
@@ -180,6 +290,41 @@ fn run_steps(
         None
     };
 
+    // Log the resolved inputs and the optional base.
+    for (n, (name, inp)) in names.iter().zip(inputs.iter()).enumerate() {
+        match inp {
+            Some(inp) => {
+                let _ = writeln!(
+                    log,
+                    "Input {}: {} ({}, {} splats)",
+                    n + 1,
+                    name,
+                    format_bytes(inp.mmap.len() as u64),
+                    format_splats(inp.info.vertex_count)
+                );
+            }
+            None => {
+                let _ = writeln!(log, "Input {}: - (empty)", n + 1);
+            }
+        }
+    }
+    if let Some(base_name) = &args.base {
+        match base.as_ref() {
+            Some(b) => {
+                let _ = writeln!(
+                    log,
+                    "Base: {} ({}, {} splats)",
+                    base_name,
+                    format_bytes(b.mmap.len() as u64),
+                    format_splats(b.info.vertex_count)
+                );
+            }
+            None => {
+                let _ = writeln!(log, "Base: - (empty)");
+            }
+        }
+    }
+
     // 3. Shared stride and header template (errors on mismatch / all '-').
     let header = header_template(&inputs, base.as_ref())?;
 
@@ -189,6 +334,7 @@ fn run_steps(
 
     let n: usize = if inputs.len() >= 2 {
         // 4a. Two or more inputs: one voxel step over the whole list.
+        let _ = writeln!(log, "Voxel step started ({} inputs)", inputs.len());
         let sources: Vec<Option<(&[u8], &PlyInfo)>> = inputs.iter().map(src_of).collect();
         if let Some(base) = base {
             // Base present: the step must write to temp1, which the scale
@@ -200,12 +346,20 @@ fn run_steps(
                 &header,
                 &mut temp_writer,
                 prog,
+                log,
                 cancel,
             )?;
             temp_writer.flush()?;
             drop(temp_writer);
             // 4b. Scale step: voxel result (file 1) against the base (file 2).
             let voxel = map_file(&temp1)?;
+            let _ = writeln!(
+                log,
+                "Scale step started (file 1: {} splats; file 2: {} splats; threshold {})",
+                format_splats(voxel.as_ref().map_or(0, |i| i.info.vertex_count)),
+                format_splats(base.info.vertex_count),
+                args.threshold
+            );
             merge::merge_scale(
                 src_of(&voxel),
                 Some((&base.mmap[..], &base.info)),
@@ -213,6 +367,7 @@ fn run_steps(
                 &header,
                 &mut writer,
                 prog,
+                log,
                 cancel,
             )?
         } else {
@@ -222,6 +377,7 @@ fn run_steps(
                 &header,
                 &mut writer,
                 prog,
+                log,
                 cancel,
             )?
         }
@@ -233,6 +389,13 @@ fn run_steps(
             .ok_or_else(|| error_msg("No input to process"))?;
         if let Some(base) = base {
             // Single input + base: one scale step straight to the output.
+            let _ = writeln!(
+                log,
+                "Scale step started (file 1: {} splats; file 2: {} splats; threshold {})",
+                format_splats(only.as_ref().map_or(0, |i| i.info.vertex_count)),
+                format_splats(base.info.vertex_count),
+                args.threshold
+            );
             merge::merge_scale(
                 src_of(&only),
                 Some((&base.mmap[..], &base.info)),
@@ -240,13 +403,22 @@ fn run_steps(
                 &header,
                 &mut writer,
                 prog,
+                log,
                 cancel,
             )?
         } else {
             // Single input, no base: passthrough copy (no progress lines).
             let inp =
                 only.ok_or_else(|| error_msg("Single input is '-' and no --base was given"))?;
-            passthrough(&inp, &mut writer)?
+            let _ = writeln!(log, "Passthrough started");
+            let t = Instant::now();
+            let n = passthrough(&inp, &mut writer)?;
+            let _ = writeln!(
+                log,
+                "Passthrough finished after {}",
+                format_duration(t.elapsed().as_secs())
+            );
+            n
         }
     };
 
@@ -258,6 +430,14 @@ fn run_steps(
 mod tests {
     use super::*;
     use crate::ply::parse_ply_header;
+
+    /// Serializes every test that runs the pipeline: they all truncate the
+    /// shared `splat-merge.log` beside the test binary, and a concurrent
+    /// open-for-write on it fails (sharing violation).
+    static RUN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn shared_log_lock() -> std::sync::MutexGuard<'static, ()> {
+        RUN_LOCK.lock().unwrap()
+    }
 
     /// Temp directory, unique per test, removed when the value is dropped.
     struct TmpDir(PathBuf);
@@ -330,8 +510,14 @@ mod tests {
         &data[i.header_len..]
     }
 
+    /// The run log path this test binary writes (see `log_path`).
+    fn exe_log_path() -> PathBuf {
+        log_path().unwrap()
+    }
+
     #[test]
     fn passthrough_single_input_is_byte_identical() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("passthrough");
         let recs = vec![record(0.0, 0.0, 0.0, 0.1), record(9.0, 9.0, 9.0, 0.2)];
         let a = write_ply(&dir, "a.ply", &recs);
@@ -345,6 +531,7 @@ mod tests {
 
     #[test]
     fn single_input_with_base_runs_scale_step() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("one-base");
         let a_small = record(0.0, 0.0, 0.0, 0.9); // exp(0.9) < e -> file 1 keeps
         let a_big = record(1.0, 1.0, 1.0, 1.5); // exp(1.5) > e -> file 1 drops
@@ -365,6 +552,7 @@ mod tests {
 
     #[test]
     fn two_inputs_voxel_then_scale_with_base() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("two-base");
         // Voxel step (size 0.5): vox(0,0,0) and vox(10,10,10).
         let a1 = record(0.0, 0.0, 0.0, 0.5); // 2-1 win in vox0
@@ -393,6 +581,7 @@ mod tests {
 
     #[test]
     fn three_inputs_voxel_chain_without_base() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("three-chain");
         // Step 1 (A+B): vox0 2-1 win -> a1, a2; vox10 0-1 win -> b_out.
         let a1 = record(0.0, 0.0, 0.0, 0.1);
@@ -419,6 +608,7 @@ mod tests {
 
     #[test]
     fn three_inputs_with_base() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("three-base");
         // Voxel step (size 0.5): vox0 a/c tie 1-1 -> a wins; vox10 b/c tie
         // 1-1 -> b wins. Kept: a1, b_out (input-list order).
@@ -447,6 +637,7 @@ mod tests {
 
     #[test]
     fn empty_slot_in_list_is_allowed() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("slots");
         let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.1)]);
         let out = dir.path("out.ply");
@@ -455,10 +646,15 @@ mod tests {
         let data = std::fs::read(&out).unwrap();
         let i = parse_ply_header(&data);
         assert_eq!(i.vertex_count, 1);
+        // The empty slot is logged as `Input 1: - (empty)` in the shared log.
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Input 1: - (empty)"));
+        assert!(rlog.contains(&format!("Input 2: {a}")));
     }
 
     #[test]
     fn all_empty_inputs_error() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("all-empty");
         let out = dir.path("out.ply");
         assert!(run(&args("-", None, &out)).is_err());
@@ -468,6 +664,7 @@ mod tests {
 
     #[test]
     fn empty_input_entry_errors() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("bad-entry");
         let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.1)]);
         let out = dir.path("out.ply");
@@ -478,6 +675,7 @@ mod tests {
 
     #[test]
     fn stride_mismatch_errors() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("stride");
         let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.1)]); // stride 44
                                                                          // 8-float records -> stride 32.
@@ -498,10 +696,16 @@ mod tests {
         let out = dir.path("out.ply");
         assert!(run(&args(&format!("{},{}", a, bs), None, &out)).is_err());
         assert!(!out.exists());
+        // The run log is kept, with the terminal failure line.
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Run failed after"));
+        assert!(rlog.contains("Stride mismatch between input files (different property layouts)"));
+        assert!(!rlog.contains("Run finished"));
     }
 
     #[test]
     fn truncated_data_errors() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("truncated");
         // Header declares 2 records, file holds 1.
         let rec = record(0.0, 0.0, 0.0, 0.1);
@@ -521,6 +725,7 @@ mod tests {
 
     #[test]
     fn non_divisible_data_errors() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("nondiv");
         // One full record (44 bytes) plus 5 stray bytes -> 49 % 44 != 0.
         let mut rec = record(0.0, 0.0, 0.0, 0.1);
@@ -541,6 +746,7 @@ mod tests {
 
     #[test]
     fn temp_files_removed_after_failure() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("cleanup");
         // 8-float records (no scale property) with equal strides on all sources:
         // the voxel step succeeds into a temp file, the scale step then fails;
@@ -570,6 +776,7 @@ mod tests {
 
     #[test]
     fn aborted_run_removes_temp_and_output_and_reports() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("abort");
         let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.5)]);
         let b = write_ply(&dir, "b.ply", &[record(5.0, 5.0, 5.0, 0.8)]);
@@ -591,10 +798,15 @@ mod tests {
         let log = String::from_utf8(sink).unwrap();
         assert!(log.contains("Aborted; temporary and partial output files removed."));
         assert!(!log.contains("Success:"));
+        // The run log is kept, with the terminal abort line.
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Run aborted after"));
+        assert!(!rlog.contains("Run finished"));
     }
 
     #[test]
     fn run_with_success_line_goes_to_sink() {
+        let _lock = shared_log_lock();
         let dir = TmpDir::new("sink");
         let recs = vec![record(0.0, 0.0, 0.0, 0.1), record(9.0, 9.0, 9.0, 0.2)];
         let a = write_ply(&dir, "a.ply", &recs);
@@ -604,5 +816,165 @@ mod tests {
         let log = String::from_utf8(sink).unwrap();
         let expected = format!("Success: 2 splats saved to {}\n", out.to_string_lossy());
         assert!(log.contains(&expected));
+    }
+
+    /// Strips the `[YYYY-MM-DD HH:MM:SS.mmm] ` prefix (asserting its shape).
+    fn bare(line: &str) -> &str {
+        assert!(
+            line.len() >= 26
+                && line.starts_with('[')
+                && line.as_bytes()[20] == b'.'
+                && line.as_bytes()[24..26] == b"] "[..]
+        );
+        &line[26..]
+    }
+
+    #[test]
+    fn successful_run_writes_run_log_beside_executable() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("runlog-passthrough");
+        let recs = vec![record(0.0, 0.0, 0.0, 0.1), record(9.0, 9.0, 9.0, 0.2)];
+        let a = write_ply(&dir, "a.ply", &recs);
+        let out = dir.path("out.ply");
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(&args(&a, None, &out), &mut sink, &NEVER).unwrap();
+
+        let in_sz = format_bytes(std::fs::metadata(&a).unwrap().len());
+        let out_sz = format_bytes(std::fs::metadata(&out).unwrap().len());
+        let a_str = a.as_str();
+        let out_str = out.to_string_lossy().into_owned();
+        let expected = vec![
+            format!(
+                "Run started (inputs: {a_str}; base: -; output: {out_str}; voxel size: 0.5; threshold: 2.7182817)"
+            ),
+            format!("Input 1: {a_str} ({in_sz}, 2 splats)"),
+            "Passthrough started".to_string(),
+            "Passthrough finished after 0s".to_string(),
+            format!("Run finished: 2 splats written to {out_str} ({out_sz}) in 0s"),
+        ];
+        let lines: Vec<String> = std::fs::read_to_string(exe_log_path())
+            .unwrap()
+            .lines()
+            .map(bare)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines, expected);
+        // Detail lines never reach the progress sink (stdout / GUI).
+        let sink_str = String::from_utf8(sink).unwrap();
+        assert!(sink_str.contains(&format!("Success: 2 splats saved to {out_str}")));
+        assert!(!sink_str.contains("Run started"));
+        assert!(!sink_str.contains("Input 1:"));
+        assert!(!sink_str.contains("Passthrough"));
+    }
+
+    #[test]
+    fn output_is_the_run_log_writes_no_run_log() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("log-out");
+        let recs = vec![record(0.0, 0.0, 0.0, 0.1), record(9.0, 9.0, 9.0, 0.2)];
+        let a = write_ply(&dir, "a.ply", &recs);
+        // The output is the run log file itself: the guard must skip opening
+        // the log (its truncation would destroy the output) and still write
+        // the PLY into that very file.
+        let out = exe_log_path();
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(
+            &crate::Args {
+                inputs: a,
+                base: None,
+                output: out.to_string_lossy().into_owned(),
+                voxel_size: 0.5,
+                threshold: 1.0f32.exp(),
+            },
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            std::fs::read(dir.path("a.ply")).unwrap()
+        );
+        let sink_str = String::from_utf8(sink).unwrap();
+        assert!(sink_str.contains(&format!(
+            "Success: 2 splats saved to {}",
+            out.to_string_lossy()
+        )));
+    }
+
+    #[test]
+    fn run_log_records_voxel_then_scale_steps_in_order() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("runlog-order");
+        // Voxel step over a+b (size 0.5): a's two splats and b's (0.3, 0.4, 0.2)
+        // share voxel (0,0,0) where a has more; b's (5,5,5) wins its own voxel
+        // -> 3 kept. Scale step (threshold e = 2.7182817): the three kept have
+        // world scale 1.65 / 1.82 / 2.23 (< e, kept), base keeps only 4.95
+        // (>= e) -> 4 of 5 kept.
+        let a = write_ply(
+            &dir,
+            "a.ply",
+            &[record(0.0, 0.0, 0.0, 0.5), record(0.2, 0.1, 0.1, 0.6)],
+        );
+        let b = write_ply(
+            &dir,
+            "b.ply",
+            &[record(0.3, 0.4, 0.2, 0.7), record(5.0, 5.0, 5.0, 0.8)],
+        );
+        let base = write_ply(
+            &dir,
+            "base.ply",
+            &[record(0.0, 1.0, 0.0, 0.9), record(7.0, 7.0, 7.0, 1.6)],
+        );
+        let out = dir.path("merged.ply");
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(
+            &args(&format!("{},{}", a, b), Some(&base), &out),
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_ply_header(&std::fs::read(&out).unwrap()).vertex_count,
+            4
+        );
+
+        let sz = |p: &str| format_bytes(std::fs::metadata(p).unwrap().len());
+        let out_str = out.to_string_lossy().into_owned();
+        let expected = vec![
+            format!(
+                "Run started (inputs: {a}, {b}; base: {base}; output: {out_str}; voxel size: 0.5; threshold: 2.7182817)"
+            ),
+            format!("Input 1: {a} ({}, 2 splats)", sz(&a)),
+            format!("Input 2: {b} ({}, 2 splats)", sz(&b)),
+            format!("Base: {base} ({}, 2 splats)", sz(&base)),
+            "Voxel step started (2 inputs)".to_string(),
+            "1 Mapping started".to_string(),
+            "1 Mapping finished after 0s".to_string(),
+            "2 Merging (voxel based) started".to_string(),
+            "2 Merging (voxel based) finished after 0s (3 kept)".to_string(),
+            "Scale step started (file 1: 3 splats; file 2: 2 splats; threshold 2.7182817)"
+                .to_string(),
+            "3 Cleaning (scale based): counting kept splats".to_string(),
+            "3 Cleaning (scale based) started (4 of 5 splats kept)".to_string(),
+            "3 Cleaning (scale based) finished after 0s".to_string(),
+            format!("Run finished: 4 splats written to {out_str} ({}) in 0s", sz(&out_str)),
+        ];
+        let lines: Vec<String> = std::fs::read_to_string(exe_log_path())
+            .unwrap()
+            .lines()
+            .map(bare)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(lines, expected);
+        assert!(!lines.iter().any(|l| l.contains('%')));
+
+        // Progress lines and Success reach the sink; detail lines do not.
+        let sink_str = String::from_utf8(sink).unwrap();
+        assert!(sink_str.contains("1 Mapping: 100% (0.0M splats)"));
+        assert!(sink_str.contains(&format!("Success: 4 splats saved to {out_str}")));
+        assert!(!sink_str.contains("1 Mapping started"));
+        assert!(!sink_str.contains("Voxel step started"));
+        assert!(!sink_str.contains("counting kept splats"));
+        assert!(!sink_str.contains("Run started"));
     }
 }

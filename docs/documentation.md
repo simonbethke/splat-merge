@@ -32,7 +32,7 @@ into one larger splat.
 - Used to remove floaters: file 1 = voxel-merged details, file 2 = base scene (all poses,
   20M splats, also used for LOD). Empirically good threshold: 0.01.
 - Runs as a single pass over the two sources (selection and output together); progress
-  reports only the `3 Scale` task (no mapping phase, see "Progress").
+  reports only the `3 Cleaning (scale based)` task (no mapping phase, see "Progress").
 
 ### Null input
 Filename `-` in any input slot (input list entry or `--base`) means an empty file.
@@ -91,11 +91,12 @@ cargo run --release -- -i scene.ply -o copy.ply
 A small native window (framework: `eframe` 0.37 / `egui`; native file dialogs via
 `rfd`), launched when the binary is run without arguments (see "Invocation").
 Layout, top to bottom:
-1. Input file list: full width, one entry per line, with a static height
-   for 7 rows (beyond 7 entries it scrolls inside the fixed-height box),
-   with a control row below it — "Add" (multi-select picker) and "Remove"
-   (enabled only while a list entry is selected) on the left, and the
-   voxel-size chooser right-aligned on the right.
+1. Input file list: full width, one entry per line, filling all remaining
+   window height (it scrolls if the entries do not fit). The list itself is a
+   visible rounded box with the theme's 1px border, inset 16px from the
+   window edges. Below it a control row — "Add" (multi-select picker) and
+   "Remove" (enabled only while a list entry is selected) on the left, and
+   the voxel-size chooser right-aligned on the right.
 2. Base-file field (single-file picker via a "Browse" button; an empty base
    means no base, like omitting `--base`). The field expands to the remaining
    width of the row; the "Browse" button and the scale-threshold chooser are
@@ -103,8 +104,12 @@ Layout, top to bottom:
 3. Output-file chooser (save dialog). The field expands to the remaining
    width of the row; the "Browse" button is right-aligned at the end of the
    row.
-4. Log output area: multiline, fills all remaining window height; new lines
-   appear at the bottom.
+4. Progress table: it spans the full window width in three equal-width
+   columns. Two rows — a header row with the column names "Mapping",
+   "Merging" and "Cleaning" (bold, centered), and a row of three progress
+   bars, one per column, each bar showing its current percentage painted
+   centered inside it. The bars are 0% before a run, move as progress lines
+   arrive, and keep their last value after the run ends.
 5. Run button at the very bottom of the window, aligned to the right.
 
 Theme and spacing:
@@ -113,24 +118,34 @@ Theme and spacing:
   inputs, all buttons and the choosers - gets a visible 1px border that
   defines its area.
 - 8px spacing between all elements.
+- The content is padded against the window edges with a 16px inset on all
+  sides.
+- The egui panels draw no separator lines; the gaps between elements are the
+  margins above, so no extra line touches the Run button or the list box.
 
 Files:
 - Chosen with a file chooser or by dragging them onto the window.
-- `*.ply` only (case-insensitive extension); other files are rejected with a log
-  line. A path already in the list is not added twice.
+- `*.ply` only (case-insensitive extension); other files are rejected with a
+  message dialog. A path already in the list is not added twice (a message
+  dialog says it is already there).
 
 Run:
 - Validation before start: at least one input, a `.ply` output path, voxel size > 0,
-  threshold >= 0. On failure the reason is logged and nothing starts.
+  threshold >= 0. On failure the reason is shown in a message dialog and nothing
+  starts.
 - While a run is active, the controls above are disabled and the pipeline's
-  progress/status/success lines stream into the log area (the same lines the CLI
-  would print on stdout).
+  lines (the same lines the CLI would print on stdout) are interpreted:
+  progress lines move the bar of their table column, and every other line is
+  shown as a native message dialog - `Success:` as information, the abort line
+  as a warning, everything else as an error.
 - The Run button becomes "Abort". Clicking it opens a native are-you-sure dialog;
   on confirmation the cancel flag is set, the run stops at the next record
   boundary, and the temp files plus the partially written output file are removed
   (see "Pipeline" — Cancellation).
 - After an abort, a failure, or a success the controls are re-enabled and the
   settings are preserved, so a rerun is immediate.
+- The run log (see "Run log") is written exactly as in the CLI: `splat-merge.log`
+  beside the executable.
 
 ## Pipeline
 A run executes these steps in order:
@@ -163,20 +178,21 @@ Cancellation (GUI abort; not reachable from the CLI):
 - The temp files are removed as on any finished run; additionally the partially
   written output file is removed and the line
   `Aborted; temporary and partial output files removed.` is written to the output
-  sink (stdout in the CLI, the log area in the GUI).
+  sink (stdout in the CLI, a message dialog in the GUI).
 - Other (non-abort) errors do not remove the output file.
 
 ## Progress
-Progress is written to the run's output sink (stdout in the CLI, the log area
-in the GUI), one set of lines per phase. A status line is
+Progress is written to the run's output sink (stdout in the CLI; in the GUI
+the lines drive the progress table and message dialogs, see "GUI"), one set
+of lines per phase. A status line is
 printed whenever the phase's cumulative splat counter crosses another million
 (triggered at each multiple of 1,000,000), and each phase closes with a final
 100% line.
 
 Tasks:
 - `1 Mapping` (voxel step only): the per-input density hashmaps are filled.
-- `2 Merging` (voxel step only): the splats are run through, selected, and written.
-- `3 Scale` (scale step only): the splats are run through, selected, and written.
+- `2 Merging (voxel based)` (voxel step only): the splats are run through, selected, and written.
+- `3 Cleaning (scale based)` (scale step only): the splats are run through, selected, and written.
 The passthrough reports no progress.
 
 Weighting: each file of a phase contributes to the 100% proportionally to its
@@ -188,10 +204,55 @@ Worked example: two files, 1 GB and 9 GB (weights 10% and 90%), the first with
 5 000 000 splats. At 1 000 000 of file 1's splats processed:
 `10% x (1M / 5M) = 2%` → `1 Mapping: 2% (1.0M splats)`.
 
-Line format: `<task>: <pct>% (<value>M splats)`, e.g. `2 Merging: 43% (12.3M splats)`.
+Line format: `<task>: <pct>% (<value>M splats)`, e.g. `2 Merging (voxel based): 43% (12.3M splats)`.
 `<pct>` is an integer (rounded); `<value>` is the crossed million boundary
 (per-million lines) or the phase's total splats (final 100% line), in millions
 with one decimal. I/O failures on progress lines are ignored.
+
+## Run log
+Every run (CLI and GUI) writes a plain-text log file beside the executable,
+named `splat-merge.log` (e.g. `C:\tools\splat-merge\splat-merge.exe` logs to
+`C:\tools\splat-merge\splat-merge.log`). It is enabled always — no flag, no
+GUI control — truncated at the start of every run, and kept after a failure
+or an abort (the temp files and the partial output are removed, the log is
+not). If the output path names the same file as the log (case-insensitive),
+no log is written. A failure to locate the executable or to create the log
+file is a run error; write failures on the already-open log are ignored.
+
+Every line begins with the UTC time the line was emitted, with millisecond
+precision: `[YYYY-MM-DD HH:MM:SS.mmm] <message>`. Lines are flushed as soon
+as they are complete, so a crashed or aborted run leaves a complete record of
+everything that happened before it.
+
+The log does not contain progress lines — for each phase it carries only the
+phase start and finish detail lines — and it does not contain the `Success:`
+or abort sink lines (the log has its own terminal lines instead). The detail
+lines below go to the log only; they never reach the CLI stdout or the GUI
+message dialogs.
+
+Line sequence (in order):
+- `Run started (inputs: <list>; base: <name or "-">; output: <path>; voxel size: <v>; threshold: <t>)`
+- One line per input slot: `Input <n>: <name> (<size>, <count> splats)`;
+  an empty slot (`-`) reads `Input <n>: - (empty)`.
+- If a base was given: `Base: <name> (<size>, <count> splats)` (or
+  `Base: - (empty)`).
+- Voxel step: `Voxel step started (<n> inputs)`, then per phase
+  `<phase> started` and `<phase> finished after <dur>` (no progress lines);
+  the second phase's finished line carries
+  the kept count: `2 Merging (voxel based) finished after <dur> (<kept> kept)`.
+- Scale step: `Scale step started (file 1: <n> splats; file 2: <n> splats; threshold <t>)`,
+  then `3 Cleaning (scale based): counting kept splats` (before the count
+  pass), `3 Cleaning (scale based) started (<kept> of <total> splats kept)`
+  (after it), and `3 Cleaning (scale based) finished after <dur>` (no
+  progress lines).
+- Passthrough: `Passthrough started` … `Passthrough finished after <dur>`.
+- Terminal line: `Run finished: <count> splats written to <path> (<size>) in <dur>`,
+  or `Run aborted after <dur>`, or `Run failed after <dur>: <error>`.
+
+Formatting: sizes are base-1024 with one decimal (`B`, `KB`, `MB`, `GB`,
+`TB`); splat counts below 1000 are plain, then thousands/millions/billions
+with one decimal (`1.5k`, `12.3M`, `2.0B`); durations are `<n>s`,
+`<n>m <nn>s`, `<n>h <nn>m <nn>s`.
 
 ## Architecture
 Single binary (CLI or GUI — see "Invocation"). Dependencies: `clap` (CLI), `memmap2`
@@ -209,19 +270,33 @@ Source layout:
   `merge_scale` (single pass, threshold keep). Both write the reconstructed header
   then the kept records byte-exact, checking the given cancel flag at each record
   (`UserAborted` error — see "Pipeline" — Cancellation). Operate on byte slices, not
-  files; emit progress through the given progress writer.
+  files; emit progress through the given progress writer, and phase start/finish
+  detail lines to the given log sink (see "Run log").
 - `src/progress.rs`: `Progress` — file-weighted phase progress (per-million status
-  lines, final 100% line); weights = byte-size shares of the phase's files.
+  lines, final 100% line); weights = byte-size shares of the phase's files; each
+  emitted line is written to the given sink only (progress lines never reach
+  the run log — see "Run log").
+- `src/logfile.rs`: `LogFile` — a `Write` sink that prefixes every complete line
+  with a UTC `[YYYY-MM-DD HH:MM:SS.mmm]` timestamp and flushes per line, including an
+  unterminated final line on drop; the log formatters `format_utc`, `format_bytes`,
+  `format_splats`, `format_duration` (see "Run log").
 - `src/gui.rs`: `eframe`/`egui` window per the "GUI" section (`launch` is the GUI
-  entry point). `is_ply` extension check; `add_input` (`.ply` + duplicate rejection
-  with a log line); `ChanWriter` (an `io::Write` sink forwarding complete lines to
-  the log area over an mpsc channel); `start_run` (validation, worker thread with a
-  shared cancel flag); the abort confirmation dialog.
+  entry point). `is_ply` extension check; `add_input` (`.ply` + duplicate rejection,
+  returning the rejection message for a dialog); `ChanWriter` (an `io::Write` sink
+  forwarding complete lines over an mpsc channel); `parse_progress_line`
+  (recognizes the three progress lines, yielding column + percentage; any other
+  line becomes a message dialog); `start_run` (validation returning the first
+  failed rule, then the worker thread with a shared cancel flag); the abort
+  confirmation dialog and the per-line message dialogs.
 - `src/pipeline.rs`: input-list parsing, file mapping/validation, stride check,
   single voxel step (to the output, or to temp1 then re-map when a scale step
   follows), scale step, passthrough, cleanup. `run` (CLI) locks stdout and delegates
   to `run_with`, which also serves the GUI worker; progress lines and the final
-  `Success:` line go to the given sink; a canceled run additionally removes the
+  `Success:` line go to the given sink; the run log file is created at run
+  start as `splat-merge.log` beside the executable (skipped when it is the
+  same file as the output) and receives the
+  `Run started`, input/base, step/phase detail and terminal lines (see "Run log");
+  it is kept after a failure or an abort; a canceled run additionally removes the
   partial output (see "Pipeline" — Cancellation).
 
 Responsibilities by item:
@@ -244,16 +319,20 @@ Responsibilities by item:
   (all source header lines except `element vertex`, rewritten with the final
   count) can be written before any record. Merging phase: for each input in list
   order, its winning records are copied byte-exact. Progress: `1 Mapping` and
-  `2 Merging` phases per the "Progress" section.
+  `2 Merging (voxel based)` phases per the "Progress" section; the phase
+  start/finish detail lines go to the given log sink (see "Run log").
 - `merge_scale`: single pass. Counts — then writes — the kept records: file 1
   kept on max world scale `< threshold`, file 2 kept on `>= threshold`, file 1's
   splats followed by file 2's. Errors `No scale in Input 1/2` when a present
-  source declares no scale property. Progress: only the `3 Scale` phase.
+  source declares no scale property. Progress: only the `3 Cleaning (scale based)`
+  phase; the phase detail lines (including `counting kept splats`) go to the given
+  log sink (see "Run log").
 - `Progress`: per-phase progress state (weights, per-file totals and processed
-  counters). `advance(file, n)` records splats and prints a line for each
-  crossed million counter boundary; `finish()` prints the final 100% line with
-  the phase's total splats unless a 100% line was already printed. Line format
-  per the "Progress" section.
+  counters). `advance(file, n, sink)` records splats and writes a line for
+  each crossed million counter boundary; `finish(sink)` writes the final 100%
+  line with the phase's total splats unless a 100% line was already printed. Every
+  emitted line goes to the given sink only (progress lines never reach the run
+  log — see "Run log"). Line format per the "Progress" section.
 - `UserAborted` (merge.rs): error type returned when the cancel flag is set; message
   is `Aborted by user`.
 - `merge_voxel` / `merge_scale`: take the cancel flag and check it at each record in
@@ -268,7 +347,12 @@ Responsibilities by item:
   `--base`, or the single-input passthrough (no progress). Progress lines and the
   final `Success:` line go to the given sink; on `UserAborted` the partially written
   output file is removed (temp files always are) and the documented abort line is
-  written to the sink.
+  written to the sink. The run log file (see "Run log") is created at run
+  start as `splat-merge.log` beside the executable (skipped when it is the
+  same file as the output), receives the `Run started`, input/base and detail
+  lines, and the terminal line
+  (`Run finished` / `Run aborted` / `Run failed`); it is kept after failure or
+  abort.
 
 ## Required test cases
 Status: implemented as of 2026-10-25 — merge-level cases in `src/merge.rs`,
@@ -293,8 +377,8 @@ GUI helper cases in `src/gui.rs`.
   one 100% line (no duplicate when the last boundary line already printed 100%)
 - Progress: weighted sub-progress matches the worked example (1M of 5M splats in a
   10%-weighted file → 2%)
-- Scale step reports only `3 Scale` (no `1 Mapping` lines); passthrough prints no
-  progress lines
+- Scale step reports only `3 Cleaning (scale based)` (no `1 Mapping` lines);
+  passthrough prints no progress lines
 - Abort: `merge_voxel` and `merge_scale` error with `Aborted by user` and write no
   output bytes when the cancel flag is pre-set
 - Abort: a canceled pipeline run (two inputs + base) leaves neither `temp1` nor
@@ -303,6 +387,25 @@ GUI helper cases in `src/gui.rs`.
 - GUI: `is_ply` accepts a `.ply`/`.PLY` name and rejects other or missing
   extensions; `ChanWriter` forwards only complete lines, in order, keeping a
   trailing partial line until `flush`
+- GUI: `parse_progress_line` maps the three progress line formats to
+  (column, percentage) and returns `None` for `Success:` / abort / other lines
+- Run log: a successful run writes `splat-merge.log` beside the executable with the
+  `Run started` line, one line per input slot (and the `Base:` line when given),
+  and a `Run finished` terminal line; every line carries a
+  `[YYYY-MM-DD HH:MM:SS.mmm]` prefix; the log contains no progress lines
+- Run log: when the output path is the same file as the log (case-insensitive),
+  no log is written and the output is still written normally
+- Run log: the log file is kept after a failed run (with a `Run failed` terminal
+  line) and after an aborted run (with a `Run aborted` terminal line)
+- Run log: a voxel-plus-scale run logs the step/phase lines in the documented
+  order, including `Voxel step started`, the `1 Mapping` /
+  `2 Merging (voxel based)` phase pairs, `Scale step started`,
+  `counting kept splats`, and `started (<kept> of <total> splats kept)`
+- Progress: every emitted line is written to the given sink only (progress
+  lines never reach the run log)
+- Run log: `LogFile` emits complete lines as they arrive (a trailing partial line
+  is written only on drop, stamped); `format_utc`, `format_bytes`, `format_splats`
+  and `format_duration` produce the documented forms
 
 ## Open questions
 - README calls the threshold "1cm³ (0.01)", but the described comparison uses max axis
@@ -314,6 +417,40 @@ GUI helper cases in `src/gui.rs`.
 
 ## Changelog
 
+- 2026-10-25 Run log: the log file is now always `splat-merge.log` beside the
+  executable (previously `<output-stem>.log` beside the output); progress lines
+  no longer appear in the log (only the phase start and finish lines do); line
+  timestamps now carry millisecond precision
+  (`[YYYY-MM-DD HH:MM:SS.mmm]`). Stdout output and GUI behavior are unchanged.
+- 2026-10-25 Run log: every run (CLI and GUI) now writes a plain-text log file
+  `<output-stem>.log` beside the output (no new flag or control). Each line is
+  stamped with a UTC `[YYYY-MM-DD HH:MM:SS]` prefix and flushed as soon as it is
+  complete; the log records the run start, per-input and base
+  name/size/splat count, step and phase start/finish with durations (so the
+  scale step's silent counting pass is visible), every progress line verbatim,
+  and a terminal `Run finished` / `Run aborted` / `Run failed` line. The log is
+  truncated at run start, kept after failure or abort, and not written when the
+  output path itself ends in `.log`. Stdout output and GUI message dialogs are
+  unchanged.
+- 2026-10-25 GUI layout: the input file list is now a visible rounded box with
+  a 1px border, inset 16px from the window edges; the egui panels' built-in
+  separator lines are disabled, so no line touches the Run button and the
+  spacing is purely the 8px margins. Appearance only, no behavior changes.
+- 2026-10-25 GUI layout: the input file list fills all remaining window
+  height (scrolling if it overflows), the progress table spans the full
+  window width in equal-width columns, and the content is padded 16px
+  against the window edges (8px between components). Layout only, no
+  behavior changes.
+- 2026-10-25 GUI progress table: the log area is replaced by a two-row,
+  three-column table ("Mapping", "Merging", "Cleaning") with one progress bar
+  per column and the percentage painted centered inside each bar; the bars
+  reset on run start and keep their last value after the run ends.
+- 2026-10-25 GUI messages: validation failures, rejected/duplicate files, run
+  failures, and the pipeline's non-progress lines (`Success:`, the abort line,
+  other errors) are now shown as native message dialogs instead of log lines.
+- 2026-10-25 Progress labels renamed (GUI and CLI): the voxel step's merge
+  phase is `2 Merging (voxel based)` and the scale step's phase is
+  `3 Cleaning (scale based)`.
 - 2026-10-25 Windows: linked with the GUI subsystem
   (`#![windows_subsystem = "windows"]`) so no console window opens when
   launching the GUI directly; CLI mode is unchanged (run from a console).

@@ -7,7 +7,8 @@ use std::io::Write;
 /// one million, and the phase closes with a single final 100% line.
 /// Line format per the "Progress" documentation section.
 pub struct Progress {
-    /// Task label, e.g. `1 Mapping`, `2 Merging` or `3 Scale`.
+    /// Task label, e.g. `1 Mapping`, `2 Merging (voxel based)` or
+    /// `3 Cleaning (scale based)`.
     label: String,
     /// Share of the phase's 100% contributed by each file (sums to 1.0 when
     /// any file has a nonzero weight).
@@ -42,20 +43,22 @@ impl Progress {
     }
 
     /// Records `n` newly processed splats of file `f` to the counters and
-    /// prints a status line for every million-counter boundary crossed.
+    /// prints a status line for every million-counter boundary crossed,
+    /// written verbatim to `out` (the progress sink) only — progress lines
+    /// never reach the run log (see the "Run log" documentation section).
     /// I/O failures on the line are ignored.
     pub fn advance(&mut self, f: usize, n: usize, out: &mut impl Write) {
         self.processed[f] = self.processed[f].saturating_add(n);
         self.counter = self.counter.saturating_add(n);
         while self.counter >= self.next {
             let pct = self.percent();
-            let _ = writeln!(
-                out,
-                "{}: {}% ({:.1}M splats)",
+            let line = format!(
+                "{}: {}% ({:.1}M splats)\n",
                 self.label,
                 pct,
                 self.next as f64 / 1_000_000.0
             );
+            let _ = out.write_all(line.as_bytes());
             if pct >= 100 {
                 self.hundred_printed = true;
             }
@@ -64,17 +67,18 @@ impl Progress {
     }
 
     /// Closes the phase: prints the final 100% line with the phase's total
-    /// splat count, unless a 100% line was already printed. I/O failures on
-    /// the line are ignored.
+    /// splat count, unless a 100% line was already printed, written verbatim
+    /// to `out` only (progress lines never reach the run log). I/O failures
+    /// on the line are ignored.
     pub fn finish(&mut self, out: &mut impl Write) {
         if !self.hundred_printed {
             let total: usize = self.totals.iter().sum();
-            let _ = writeln!(
-                out,
-                "{}: 100% ({:.1}M splats)",
+            let line = format!(
+                "{}: 100% ({:.1}M splats)\n",
                 self.label,
                 total as f64 / 1_000_000.0
             );
+            let _ = out.write_all(line.as_bytes());
         }
     }
 
