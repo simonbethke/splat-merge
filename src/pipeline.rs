@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::merge::{self, MergeMode};
+use crate::merge;
 use crate::ply::{parse_ply_header, rewrite_header, validate, PlyInfo};
 use crate::Args;
 
@@ -29,7 +29,7 @@ fn map_file(path: &Path) -> Result<Option<Input>, Box<dyn std::error::Error>> {
     Ok(Some(Input { mmap, info }))
 }
 
-/// Splits a mapped input into the byte view plus metadata `merge_pair` needs.
+/// Splits a mapped input into the byte view plus metadata the merge functions need.
 fn src_of(inp: &Option<Input>) -> Option<(&[u8], &PlyInfo)> {
     inp.as_ref().map(|i| (&i.mmap[..], &i.info))
 }
@@ -110,21 +110,6 @@ fn error_msg(msg: &str) -> Box<dyn std::error::Error> {
     Box::<dyn std::error::Error>::from(msg.to_string())
 }
 
-/// Runs one voxel-chain step into a temp file and remaps the result.
-fn merge_step(
-    cur: &Option<Input>,
-    next: &Option<Input>,
-    mode: MergeMode,
-    header: &str,
-    dest: &Path,
-) -> Result<Option<Input>, Box<dyn std::error::Error>> {
-    let out = File::create(dest)?;
-    let mut writer = BufWriter::new(out);
-    merge::merge_pair(src_of(cur), src_of(next), mode, header, &mut writer)?;
-    writer.flush()?;
-    map_file(dest)
-}
-
 /// Copies a single input to `out` verbatim (passthrough), count unchanged.
 fn passthrough(inp: &Input, out: &mut impl Write) -> Result<usize, Box<dyn std::error::Error>> {
     rewrite_header(out, &inp.info.raw_header, inp.info.vertex_count)?;
@@ -155,78 +140,67 @@ pub fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let header = header_template(&inputs, base.as_ref())?;
 
     let (temp1, temp2) = temp_paths(&args.output)?;
-    let _temp_guard = TempGuard::new(temp1.clone(), temp2.clone());
+    let _temp_guard = TempGuard::new(temp1.clone(), temp2);
     let mut writer = BufWriter::new(File::create(&args.output)?);
+    // Locked stdout for progress lines; released before the `Success:` line
+    // so printing cannot deadlock against itself.
+    let mut stdout = std::io::stdout().lock();
 
-    let total: Result<usize, Box<dyn std::error::Error>> = if inputs.len() == 1 {
+    let n: usize = if inputs.len() >= 2 {
+        // 4a. Two or more inputs: one voxel step over the whole list.
+        let sources: Vec<Option<(&[u8], &PlyInfo)>> = inputs.iter().map(src_of).collect();
+        if let Some(base) = base {
+            // Base present: the step must write to temp1, which the scale
+            // step re-maps as file 1 (see the "Pipeline" section).
+            let mut temp_writer = BufWriter::new(File::create(&temp1)?);
+            merge::merge_voxel(
+                &sources,
+                args.voxel_size,
+                &header,
+                &mut temp_writer,
+                &mut stdout,
+            )?;
+            temp_writer.flush()?;
+            drop(temp_writer);
+            // 4b. Scale step: voxel result (file 1) against the base (file 2).
+            let voxel = map_file(&temp1)?;
+            merge::merge_scale(
+                src_of(&voxel),
+                Some((&base.mmap[..], &base.info)),
+                args.threshold,
+                &header,
+                &mut writer,
+                &mut stdout,
+            )?
+        } else {
+            merge::merge_voxel(&sources, args.voxel_size, &header, &mut writer, &mut stdout)?
+        }
+    } else {
+        // 4c. Single input slot.
         let only = inputs
             .into_iter()
             .next()
             .ok_or_else(|| error_msg("No input to process"))?;
         if let Some(base) = base {
             // Single input + base: one scale step straight to the output.
-            merge::merge_pair(
+            merge::merge_scale(
                 src_of(&only),
                 Some((&base.mmap[..], &base.info)),
-                MergeMode::Scale {
-                    threshold: args.threshold,
-                },
+                args.threshold,
                 &header,
                 &mut writer,
-            )
+                &mut stdout,
+            )?
         } else {
-            // Single input, no base: passthrough copy.
+            // Single input, no base: passthrough copy (no progress lines).
             let inp =
                 only.ok_or_else(|| error_msg("Single input is '-' and no --base was given"))?;
-            Ok(passthrough(&inp, &mut writer)?)
+            passthrough(&inp, &mut writer)?
         }
-    } else {
-        // Voxel chain over the input list, in order.
-        let mut it = inputs.into_iter();
-        let mut cur = it.next().ok_or_else(|| error_msg("No input to process"))?;
-        let rest: Vec<Option<Input>> = it.collect();
-        let last = rest.len() - 1;
-        let voxel = MergeMode::Voxel {
-            voxel_size: args.voxel_size,
-        };
-        let mut count = None;
-        for (k, next) in rest.into_iter().enumerate() {
-            if k == last && base.is_none() {
-                // Final step of the run without a base: write the output directly.
-                count = Some(merge::merge_pair(
-                    src_of(&cur),
-                    src_of(&next),
-                    voxel,
-                    &header,
-                    &mut writer,
-                )?);
-                break;
-            }
-            let dest = if k % 2 == 0 { &temp1 } else { &temp2 };
-            cur = merge_step(&cur, &next, voxel, &header, dest)?;
-        }
-        if base.is_some() {
-            // Final scale step: accumulated result (file 1) against the base (file 2).
-            let b = base
-                .as_ref()
-                .ok_or_else(|| error_msg("Missing --base file"))?;
-            count = Some(merge::merge_pair(
-                src_of(&cur),
-                Some((&b.mmap[..], &b.info)),
-                MergeMode::Scale {
-                    threshold: args.threshold,
-                },
-                &header,
-                &mut writer,
-            )?);
-        }
-        count.ok_or_else(|| error_msg("Pipeline produced no output"))
     };
 
-    let flush = writer.flush();
-
-    let n = total?;
-    flush?;
+    drop(stdout);
+    writer.flush()?;
     println!("Success: {} splats saved to {}", n, args.output);
     Ok(())
 }
@@ -392,6 +366,34 @@ mod tests {
         assert_eq!(body_of(&data), expected.as_slice());
         assert!(!dir.path("out3.temp1.ply").exists());
         assert!(!dir.path("out3.temp2.ply").exists());
+    }
+
+    #[test]
+    fn three_inputs_with_base() {
+        let dir = TmpDir::new("three-base");
+        // Voxel step (size 0.5): vox0 a/c tie 1-1 -> a wins; vox10 b/c tie
+        // 1-1 -> b wins. Kept: a1, b_out (input-list order).
+        let a1 = record(0.0, 0.0, 0.0, 0.5); // kept in voxel; exp(0.5) < e -> kept in scale
+        let c0 = record(0.1, 0.1, 0.1, 0.3); // loses tie in vox0
+        let b_out = record(5.0, 5.0, 5.0, 1.8); // wins tie in vox10; exp(1.8) >= e -> dropped
+        let c10 = record(5.1, 5.1, 5.1, 0.9); // loses tie in vox10
+                                              // Scale step: threshold = e.
+        let base_small = record(1.0, 0.0, 0.0, 0.6); // exp(0.6) < e -> file 2 drops
+        let base_keep = record(2.0, 0.0, 5.0, 1.7); // exp(1.7) >= e -> file 2 keeps
+        let a = write_ply(&dir, "a.ply", std::slice::from_ref(&a1));
+        let b = write_ply(&dir, "b.ply", std::slice::from_ref(&b_out));
+        let c = write_ply(&dir, "c.ply", &[c0, c10]);
+        let base = write_ply(&dir, "base.ply", &[base_small, base_keep.clone()]);
+        let out = dir.path("out3b.ply");
+        run(&args(&format!("{},{},{}", a, b, c), Some(&base), &out)).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let i = parse_ply_header(&data);
+        assert_eq!(i.vertex_count, 2);
+        let mut expected = a1;
+        expected.extend(base_keep);
+        assert_eq!(body_of(&data), expected.as_slice());
+        assert!(!dir.path("out3b.temp1.ply").exists());
+        assert!(!dir.path("out3b.temp2.ply").exists());
     }
 
     #[test]

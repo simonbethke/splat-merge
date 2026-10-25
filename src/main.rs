@@ -1,6 +1,7 @@
 mod merge;
 mod pipeline;
 mod ply;
+mod progress;
 
 use clap::Parser;
 
