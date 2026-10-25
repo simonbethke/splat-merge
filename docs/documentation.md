@@ -56,6 +56,12 @@ One executable, two modes:
 - **No arguments**: launches the GUI window (see "GUI").
 - **One or more arguments**: CLI mode with the flags below.
 
+Windows: the binary is linked with the GUI subsystem
+(`#![windows_subsystem = "windows"]`), so double-clicking it (no arguments)
+opens only the window, no console. CLI mode requires an existing console
+(e.g. cmd / PowerShell); running it without one is an error, which is not
+reachable by double-clicking.
+
 ## CLI
 | Flag | Meaning |
 |---|---|
@@ -308,6 +314,9 @@ GUI helper cases in `src/gui.rs`.
 
 ## Changelog
 
+- 2026-10-25 Windows: linked with the GUI subsystem
+  (`#![windows_subsystem = "windows"]`) so no console window opens when
+  launching the GUI directly; CLI mode is unchanged (run from a console).
 - 2026-10-25 Progress label: the scale step's merge phase is now reported as
   `3 Scale` (previously `2 Merging`, which collided with the voxel step's
   `2 Merging` phase); the voxel step's labels are unchanged.

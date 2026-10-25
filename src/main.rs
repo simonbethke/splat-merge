@@ -1,3 +1,7 @@
+// Link as a GUI program on Windows so double-clicking (no arguments) does
+// not pop a console window; ignored on other platforms.
+#![windows_subsystem = "windows"]
+
 mod gui;
 mod merge;
 mod pipeline;
