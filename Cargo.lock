@@ -1671,6 +1671,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3159,8 +3161,10 @@ dependencies = [
  "clap",
  "eframe",
  "hashbrown 0.14.5",
+ "image",
  "memmap2",
  "rfd",
+ "winit",
 ]
 
 [[package]]

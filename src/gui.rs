@@ -3,6 +3,10 @@
 //! (`.ply` filtering, input validation, the line sink for the worker) is
 //! here and unit-tested; the heavy work runs on a worker thread through
 //! `pipeline::run_with`.
+//!
+//! The screen itself is a pure function of [`GuiState`], so the same
+//! rendering is available to `crate::debug_render`, which renders a
+//! documented GUI state from a JSON file (docs section "Debug rendering").
 
 use std::io::Write;
 use std::path::Path;
@@ -30,8 +34,9 @@ pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Applies the window theme once at startup (docs "GUI"): dark theme, 8px
 /// spacing between elements, and a visible 1px border around every
-/// interactive widget (list rows, text inputs, buttons, choosers).
-fn apply_theme(cc: &eframe::CreationContext<'_>) {
+/// interactive widget (list rows, text inputs, buttons, choosers). Shared
+/// with the debug-render window (docs "Debug rendering").
+pub(crate) fn apply_theme(cc: &eframe::CreationContext<'_>) {
     let mut style = egui::Theme::Dark.default_style();
     let border = egui::Stroke::new(1.0, egui::Color32::from_gray(110));
     for visuals in [
@@ -47,27 +52,61 @@ fn apply_theme(cc: &eframe::CreationContext<'_>) {
     cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
 }
 
-/// The window state: current settings (kept across runs), the progress-table
-/// percentages, and the run/abort state of the active worker thread.
-struct Gui {
+/// The screen state the GUI renders from (docs section "GUI" and "Debug
+/// rendering"): the current settings plus the progress-table percentages and
+/// the run flag. The interactive window builds one from
+/// [`GuiState::default`] and edits it as the user interacts;
+/// `crate::debug_render` builds one from a JSON state file. Both paths then
+/// render through the same widgets.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GuiState {
     /// Input file list, in order (drives `Args.inputs`).
-    inputs: Vec<String>,
-    /// Index into `inputs` of the currently selected list entry.
-    selected: usize,
-    /// Whether `selected` refers to an entry (reset when the list changes).
-    has_selection: bool,
+    pub(crate) inputs: Vec<String>,
+    /// Selected list entry, or `None` (reset when the list changes).
+    pub(crate) selected: Option<usize>,
     /// Base file path text; empty means no base file.
-    base: String,
-    /// Cube edge length for the voxel steps.
-    voxel: f32,
-    /// Max-scale threshold for the scale step.
-    thresh: f32,
+    pub(crate) base: String,
+    /// Cube edge length for the voxel steps (same default as the CLI, docs
+    /// section "CLI").
+    pub(crate) voxel_size: f32,
+    /// Voxel-axis checkboxes "Voxels: X", "Y", "Z" (X, Y, Z state; checked by
+    /// default; an unchecked axis is not part of the cell key — docs "GUI"
+    /// layout 1 and "Modes — voxel").
+    pub(crate) axes: [bool; 3],
+    /// Max-scale threshold for the scale step (same default as the CLI, docs
+    /// section "CLI").
+    pub(crate) threshold: f32,
     /// Output PLY path text.
-    output: String,
+    pub(crate) output: String,
     /// Progress-table state: 0–100% per column (Mapping, Merging, Cleaning).
-    progress: [u32; 3],
-    /// A worker thread is running.
-    running: bool,
+    pub(crate) progress: [u32; 3],
+    /// A pipeline run is active: controls disabled, button reads "Abort".
+    pub(crate) running: bool,
+}
+
+impl Default for GuiState {
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            selected: None,
+            base: String::new(),
+            // Same defaults as the CLI (docs section "CLI").
+            voxel_size: 0.5,
+            // All axes on (docs "GUI" layout 1; "Modes — voxel").
+            axes: [true; 3],
+            threshold: 0.01,
+            output: String::new(),
+            progress: [0; 3],
+            running: false,
+        }
+    }
+}
+
+/// The eframe application: owns the UI state and runs the pipeline on a
+/// worker thread.
+pub(crate) struct Gui {
+    /// The screen state (settings, progress, run flag).
+    state: GuiState,
     /// Abort was confirmed; the dialog must not be shown again this run.
     aborting: bool,
     /// Shared with the worker thread; set on a confirmed abort.
@@ -78,19 +117,18 @@ struct Gui {
     rx: Option<mpsc::Receiver<String>>,
 }
 
+impl GuiState {
+    /// True when the "Remove" button should be enabled: a list entry is
+    /// selected and that entry still exists.
+    fn remove_enabled(&self) -> bool {
+        self.selected.is_some_and(|i| i < self.inputs.len())
+    }
+}
+
 impl Default for Gui {
     fn default() -> Self {
         Self {
-            inputs: Vec::new(),
-            selected: 0,
-            has_selection: false,
-            base: String::new(),
-            // Same defaults as the CLI (docs section "CLI").
-            voxel: 0.5,
-            thresh: 0.01,
-            output: String::new(),
-            progress: [0; 3],
-            running: false,
+            state: GuiState::default(),
             aborting: false,
             cancel: Arc::new(AtomicBool::new(false)),
             worker: None,
@@ -109,6 +147,16 @@ fn is_ply(path: &Path) -> bool {
 }
 
 impl Gui {
+    /// Builds the app around a given screen state (used by
+    /// `crate::debug_render`); interactive widgets still behave as in the
+    /// window, but the window never runs a pipeline in that mode.
+    pub(crate) fn new_with(state: GuiState) -> Self {
+        Self {
+            state,
+            ..Self::default()
+        }
+    }
+
     /// Adds `path` to the input list; non-`.ply` files and duplicates
     /// (case-insensitive path comparison) are not added and yield the
     /// rejection message for the caller to show in a dialog.
@@ -119,13 +167,14 @@ impl Gui {
         }
         let incoming = path.to_string_lossy().into_owned();
         if self
+            .state
             .inputs
             .iter()
             .any(|stored| stored.eq_ignore_ascii_case(&incoming))
         {
             return Some(format!("Already added: {display}"));
         }
-        self.inputs.push(incoming);
+        self.state.inputs.push(incoming);
         None
     }
 
@@ -143,32 +192,50 @@ impl Gui {
         }
     }
 
+    /// Validates the settings, returning the first failed rule as the dialog
+    /// message (`None` when valid). Split from `start_run` so the rejections
+    /// are testable without spawning the worker thread.
+    fn start_run_error(&self) -> Option<String> {
+        if self.state.inputs.is_empty() {
+            return Some("At least one input file is required.".to_owned());
+        }
+        if self.state.output.trim().is_empty() {
+            return Some("An output file is required.".to_owned());
+        }
+        if !is_ply(Path::new(&self.state.output)) {
+            return Some("The output file must have a .ply extension.".to_owned());
+        }
+        if self.state.voxel_size <= 0.0 || self.state.voxel_size.is_nan() {
+            return Some("Voxel size must be greater than zero.".to_owned());
+        }
+        if self.state.threshold < 0.0 || self.state.threshold.is_nan() {
+            return Some("The threshold must be zero or greater.".to_owned());
+        }
+        if !self.state.axes.iter().any(|&on| on) {
+            return Some("At least one voxel axis (X, Y or Z) must be checked.".to_owned());
+        }
+        None
+    }
+
     /// Validates the settings (returning the first failed rule as the dialog
     /// message) and, if valid, resets the progress table and starts the
     /// worker thread.
     fn start_run(&mut self) -> Option<String> {
-        if self.inputs.is_empty() {
-            return Some("At least one input file is required.".to_owned());
+        if let Some(reason) = self.start_run_error() {
+            return Some(reason);
         }
-        if self.output.trim().is_empty() {
-            return Some("An output file is required.".to_owned());
-        }
-        if !is_ply(Path::new(&self.output)) {
-            return Some("The output file must have a .ply extension.".to_owned());
-        }
-        if self.voxel <= 0.0 || self.voxel.is_nan() {
-            return Some("Voxel size must be greater than zero.".to_owned());
-        }
-        if self.thresh < 0.0 || self.thresh.is_nan() {
-            return Some("The threshold must be zero or greater.".to_owned());
-        }
-        let base = self.base.trim().to_owned();
+        let base = self.state.base.trim().to_owned();
         let args = crate::Args {
-            inputs: self.inputs.join(","),
+            inputs: self.state.inputs.join(","),
             base: if base.is_empty() { None } else { Some(base) },
-            output: self.output.trim().to_owned(),
-            voxel_size: self.voxel,
-            threshold: self.thresh,
+            output: self.state.output.trim().to_owned(),
+            voxel_size: self.state.voxel_size,
+            threshold: self.state.threshold,
+            voxel_axes: crate::VoxelAxes::from_flags(
+                self.state.axes[0],
+                self.state.axes[1],
+                self.state.axes[2],
+            ),
         };
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -178,11 +245,10 @@ impl Gui {
         }));
         self.rx = Some(rx);
         self.cancel = cancel;
-        self.progress = [0; 3];
-        self.running = true;
+        self.state.progress = [0; 3];
+        self.state.running = true;
         self.aborting = false;
-        self.selected = 0;
-        self.has_selection = false;
+        self.state.selected = None;
         None
     }
 
@@ -193,7 +259,7 @@ impl Gui {
         if let Some(rx) = self.rx.as_ref() {
             while let Ok(line) = rx.try_recv() {
                 if let Some((col, pct)) = parse_progress_line(&line) {
-                    self.progress[col] = pct;
+                    self.state.progress[col] = pct;
                 } else {
                     show_message(message_level(&line), &line);
                 }
@@ -211,11 +277,10 @@ impl Gui {
             Ok(Err(msg)) => Some(format!("Run failed: {msg}")),
             Err(_) => Some("Run failed: the worker thread panicked.".to_owned()),
         };
-        self.running = false;
+        self.state.running = false;
         self.aborting = false;
         self.cancel = Arc::new(AtomicBool::new(false));
-        self.selected = 0;
-        self.has_selection = false;
+        self.state.selected = None;
         self.rx = None;
         failure
     }
@@ -288,13 +353,23 @@ impl Write for ChanWriter {
 
 impl eframe::App for Gui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl Gui {
+    /// Paints the whole screen (docs section "GUI"): the Run/Abort bar, the
+    /// settings block and the input file list. Shared with the debug
+    /// rendering path (docs section "Debug rendering"), which renders the
+    /// same widgets from a JSON state file.
+    pub(crate) fn render(&mut self, ui: &mut egui::Ui) {
         self.drain_lines();
-        if self.running && self.worker.as_ref().is_some_and(|w| w.is_finished()) {
+        if self.state.running && self.worker.as_ref().is_some_and(|w| w.is_finished()) {
             if let Some(msg) = self.finish_run() {
                 show_message(rfd::MessageLevel::Error, &msg);
             }
         }
-        if self.running {
+        if self.state.running {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -322,7 +397,7 @@ impl eframe::App for Gui {
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.running {
+                    if self.state.running {
                         // Abort: confirm natively, then set the cancel flag.
                         if ui
                             .add_enabled(!self.aborting, egui::Button::new("Abort"))
@@ -355,7 +430,7 @@ impl eframe::App for Gui {
             .show_separator_line(false)
             .show(ui, |ui| {
                 ui.vertical(|ui| {
-                    ui.add_enabled_ui(!self.running, |ui| self.settings_rows(ui));
+                    ui.add_enabled_ui(!self.state.running, |ui| self.settings_rows(ui));
                     ui.separator();
                     // Layout 4: the 3x2 progress table (docs "GUI", layout 4).
                     self.progress_table(ui);
@@ -366,7 +441,7 @@ impl eframe::App for Gui {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(EDGE_PAD)))
             .show(ui, |ui| {
-                ui.add_enabled_ui(!self.running, |ui| self.file_list(ui));
+                ui.add_enabled_ui(!self.state.running, |ui| self.file_list(ui));
             });
     }
 }
@@ -390,14 +465,13 @@ impl Gui {
             .auto_shrink([false, false])
             .id_salt("input-list")
             .show(&mut prepared.content_ui, |ui| {
-                if self.inputs.is_empty() {
+                if self.state.inputs.is_empty() {
                     ui.label("No input files. Use Add, or drag .ply files onto the window.");
                 } else {
-                    for (idx, input) in self.inputs.iter().enumerate() {
-                        let selected = self.has_selection && self.selected == idx;
+                    for (idx, input) in self.state.inputs.iter().enumerate() {
+                        let selected = self.state.selected == Some(idx);
                         if ui.selectable_label(selected, input.as_str()).clicked() {
-                            self.selected = idx;
-                            self.has_selection = true;
+                            self.state.selected = Some(idx);
                         }
                     }
                 }
@@ -415,19 +489,22 @@ impl Gui {
             if ui.button("Add").clicked() {
                 self.pick_inputs();
             }
-            let remove = ui.add_enabled(
-                self.has_selection && self.selected < self.inputs.len(),
-                egui::Button::new("Remove"),
-            );
+            let remove = ui.add_enabled(self.state.remove_enabled(), egui::Button::new("Remove"));
             if remove.clicked() {
-                self.inputs.remove(self.selected);
-                self.selected = 0;
-                self.has_selection = false;
+                if let Some(idx) = self.state.selected.filter(|&i| i < self.state.inputs.len()) {
+                    self.state.inputs.remove(idx);
+                }
+                self.state.selected = None;
             }
+            // The checked axes define the voxel cells; an unchecked axis is
+            // ignored (docs "GUI" layout 1 and "Modes — voxel").
+            ui.checkbox(&mut self.state.axes[0], "Voxels: X");
+            ui.checkbox(&mut self.state.axes[1], "Voxels: Y");
+            ui.checkbox(&mut self.state.axes[2], "Voxels: Z");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // In a right-to-left layout the first widget placed lands at
                 // the right end, so add the value first and the label after.
-                ui.add(egui::DragValue::new(&mut self.voxel).speed(0.1));
+                ui.add(egui::DragValue::new(&mut self.state.voxel_size).speed(0.1));
                 ui.label("Voxel size:");
             });
         });
@@ -438,23 +515,23 @@ impl Gui {
         let base_trailing = measure_group_width(ui, |probe| {
             probe.add(egui::Button::new("Browse"));
             probe.label("Threshold:");
-            probe.add(egui::DragValue::new(&mut self.thresh).speed(0.01));
+            probe.add(egui::DragValue::new(&mut self.state.threshold).speed(0.01));
         });
         ui.horizontal(|ui| {
             ui.label("Base:");
             let field_width =
                 (ui.available_width() - base_trailing - ui.spacing().item_spacing.x).max(60.0);
-            ui.add(egui::TextEdit::singleline(&mut self.base).desired_width(field_width));
+            ui.add(egui::TextEdit::singleline(&mut self.state.base).desired_width(field_width));
             if ui.button("Browse").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("PLY files", &["ply"])
                     .pick_file()
                 {
-                    self.base = path.to_string_lossy().into_owned();
+                    self.state.base = path.to_string_lossy().into_owned();
                 }
             }
             ui.label("Threshold:");
-            ui.add(egui::DragValue::new(&mut self.thresh).speed(0.01));
+            ui.add(egui::DragValue::new(&mut self.state.threshold).speed(0.01));
         });
         // Layout 3: output field expanding to the remaining row width, with
         // "Browse" right-aligned (measured the same way).
@@ -465,14 +542,14 @@ impl Gui {
             ui.label("Output:");
             let field_width =
                 (ui.available_width() - output_trailing - ui.spacing().item_spacing.x).max(60.0);
-            ui.add(egui::TextEdit::singleline(&mut self.output).desired_width(field_width));
+            ui.add(egui::TextEdit::singleline(&mut self.state.output).desired_width(field_width));
             if ui.button("Browse").clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("PLY files", &["ply"])
                     .set_file_name("merged.ply")
                     .save_file()
                 {
-                    self.output = path.to_string_lossy().into_owned();
+                    self.state.output = path.to_string_lossy().into_owned();
                 }
             }
         });
@@ -526,7 +603,7 @@ impl Gui {
                 }
             });
             ui.horizontal(|ui| {
-                for &pct in self.progress.iter() {
+                for &pct in self.state.progress.iter() {
                     let rect = ui
                         .add(egui::ProgressBar::new(pct as f32 / 100.0).desired_width(col))
                         .rect;
@@ -621,7 +698,102 @@ mod tests {
         assert!(gui.add_input(Path::new("a.ply")).is_none());
         let msg = gui.add_input(Path::new("A.PLY")).expect("duplicate");
         assert!(msg.to_ascii_lowercase().contains("already added"));
-        assert_eq!(gui.inputs, vec!["a.ply".to_owned()]);
+        assert_eq!(gui.state.inputs, vec!["a.ply".to_owned()]);
+    }
+
+    #[test]
+    fn start_run_requires_at_least_one_voxel_axis() {
+        let mut gui = Gui::default();
+        gui.state.inputs.push("a.ply".to_owned());
+        gui.state.output = "out.ply".to_owned();
+        let expected = "At least one voxel axis (X, Y or Z) must be checked.".to_owned();
+        // All three boxes unchecked: the documented rejection.
+        gui.state.axes = [false; 3];
+        assert_eq!(gui.start_run_error(), Some(expected));
+        // Any single axis on its own is accepted (and so is the default,
+        // all three checked).
+        for axes in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+            [true, true, true],
+        ] {
+            gui.state.axes = axes;
+            assert_eq!(gui.start_run_error(), None, "axes {axes:?}");
+        }
+    }
+
+    /// `GuiState::default` is exactly the GUI startup defaults (docs "GUI"
+    /// layout 1-3 and section "CLI"): no files, no selection, empty base and
+    /// output, the CLI defaults for the numeric settings, all axes on, empty
+    /// progress table, not running.
+    #[test]
+    fn gui_state_defaults_match_docs() {
+        let s = GuiState::default();
+        assert!(s.inputs.is_empty());
+        assert_eq!(s.selected, None);
+        assert_eq!(s.base, "");
+        assert_eq!(s.voxel_size, 0.5);
+        assert_eq!(s.axes, [true, true, true]);
+        assert_eq!(s.threshold, 0.01);
+        assert_eq!(s.output, "");
+        assert_eq!(s.progress, [0, 0, 0]);
+        assert!(!s.running);
+    }
+
+    /// `Gui::default` and `Gui::new_with` both expose the state exactly as
+    /// given, so the debug-rendered screen starts from the documented state.
+    #[test]
+    fn gui_state_is_identity_and_removable() {
+        assert_eq!(Gui::default().state, GuiState::default());
+
+        let state = GuiState {
+            inputs: vec!["a.ply".to_owned(), "b.ply".to_owned()],
+            selected: Some(1),
+            base: "base.ply".to_owned(),
+            voxel_size: 1.0,
+            axes: [true, false, true],
+            threshold: 0.5,
+            output: "out.ply".to_owned(),
+            progress: [10, 20, 30],
+            running: true,
+        };
+        let gui = Gui::new_with(state.clone());
+        assert_eq!(gui.state, state);
+        assert!(gui.state.remove_enabled());
+        assert!(!GuiState {
+            selected: Some(2),
+            ..state.clone()
+        }
+        .remove_enabled());
+        assert!(!GuiState {
+            selected: None,
+            ..state
+        }
+        .remove_enabled());
+    }
+
+    /// Painting the full screen (all three layouts) with a non-default state
+    /// must not panic and must leave the state untouched — the debug render
+    /// relies on `render` being a pure function of the state.
+    #[test]
+    fn render_is_pure_with_a_full_state() {
+        let state = GuiState {
+            inputs: vec!["a.ply".to_owned(), "b.ply".to_owned(), "c.ply".to_owned()],
+            selected: Some(0),
+            base: "base.ply".to_owned(),
+            voxel_size: 0.75,
+            axes: [true, true, false],
+            threshold: 0.02,
+            output: "out.ply".to_owned(),
+            progress: [25, 50, 75],
+            running: false,
+        };
+        let mut gui = Gui::new_with(state.clone());
+        egui::__run_test_ui(|ui| {
+            gui.render(ui);
+        });
+        assert_eq!(gui.state, state);
     }
 
     #[test]

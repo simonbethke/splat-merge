@@ -6,16 +6,31 @@ use std::time::Instant;
 use crate::logfile::{format_duration, format_splats};
 use crate::ply::{get_max_scale, get_pos, rewrite_header, PlyInfo};
 use crate::progress::Progress;
+use crate::VoxelAxes;
 
-/// Voxel index key for a position: `floor(p / voxel_size)` per axis.
+/// Voxel index key for a position: `floor(p / voxel_size)` per enabled axis,
+/// 0 for each disabled axis (see the "Modes — voxel" docs section).
 type Key = (i32, i32, i32);
 
 #[inline(always)]
-fn voxel_key(p: [f32; 3], voxel_size: f32) -> Key {
+fn voxel_key(p: [f32; 3], voxel_size: f32, axes: VoxelAxes) -> Key {
+    let mask = axes.mask();
     (
-        (p[0] / voxel_size).floor() as i32,
-        (p[1] / voxel_size).floor() as i32,
-        (p[2] / voxel_size).floor() as i32,
+        if mask & 1 != 0 {
+            (p[0] / voxel_size).floor() as i32
+        } else {
+            0
+        },
+        if mask & 2 != 0 {
+            (p[1] / voxel_size).floor() as i32
+        } else {
+            0
+        },
+        if mask & 4 != 0 {
+            (p[2] / voxel_size).floor() as i32
+        } else {
+            0
+        },
     )
 }
 
@@ -56,9 +71,10 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), UserAborted> {
 
 /// One voxel (density) merge of all (possibly empty) sources in a single
 /// run: one density hashmap per non-empty source, then a per-voxel winner
-/// pass. The winner per voxel is the earliest input (list order) with the
-/// most splats there; kept splats are written in input-list order, record
-/// order within each file.
+/// pass. Cells are defined by the enabled axes (`axes`; a disabled axis's
+/// index is 0, so cells are extruded along it). The winner per voxel is the
+/// earliest input (list order) with the most splats there; kept splats are
+/// written in input-list order, record order within each file.
 ///
 /// Writes the reconstructed header (from `header`, rewritten with the
 /// final count) followed by the kept records byte-exact. Progress phases
@@ -67,9 +83,13 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), UserAborted> {
 /// detail lines (with durations) go to `log`, per the "Run log" section.
 /// The `cancel` flag is checked per record/file (`UserAborted` error).
 /// Returns the number of splats written.
+// sources + voxel_size + axes + header + out/prog/log sinks + cancel make 8
+// parameters; a struct would obscure the positional-only call site.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_voxel(
     sources: &[Option<(&[u8], &PlyInfo)>],
     voxel_size: f32,
+    axes: VoxelAxes,
     header: &str,
     out: &mut impl Write,
     prog: &mut impl Write,
@@ -96,7 +116,7 @@ pub fn merge_voxel(
             for idx in 0..i.vertex_count {
                 check_cancel(cancel)?;
                 let p = get_pos(&m[i.header_len + idx * i.stride..]);
-                *maps[f].entry(voxel_key(p, voxel_size)).or_insert(0) += 1;
+                *maps[f].entry(voxel_key(p, voxel_size, axes)).or_insert(0) += 1;
                 prog1.advance(f, 1, prog);
             }
         }
@@ -142,6 +162,7 @@ pub fn merge_voxel(
                     .get(&voxel_key(
                         get_pos(&m[i.header_len + idx * i.stride..]),
                         voxel_size,
+                        axes,
                     ))
                     .is_some_and(|wf| wf.0 == f)
                 {
@@ -342,6 +363,11 @@ mod tests {
     /// 11-float records; returns output bytes, splat count, the progress
     /// lines in order, and the run-log lines in order.
     fn run_voxel(files: &[Option<Vec<Vec<u8>>>]) -> RunOut {
+        run_voxel_axes(files, VoxelAxes::all())
+    }
+
+    /// As `run_voxel`, but with a specific voxel-axis set.
+    fn run_voxel_axes(files: &[Option<Vec<Vec<u8>>>], axes: VoxelAxes) -> RunOut {
         // Build (buffer, info) pairs in file order; empty slots stay `None`
         // in `sources`, aligned 1:1 with `files`.
         let mut pairs: Vec<(Vec<u8>, PlyInfo)> = Vec::new();
@@ -370,7 +396,9 @@ mod tests {
         let mut prog = Vec::new();
         let mut log = Vec::new();
         let nc = AtomicBool::new(false);
-        let n = merge_voxel(&sources, 0.5, &header, &mut out, &mut prog, &mut log, &nc)?;
+        let n = merge_voxel(
+            &sources, 0.5, axes, &header, &mut out, &mut prog, &mut log, &nc,
+        )?;
         Ok((
             out,
             n,
@@ -451,6 +479,51 @@ mod tests {
         assert_eq!(n, 2);
         let mut expected = a1;
         expected.extend(a2);
+        assert_eq!(body_of(&out), expected);
+    }
+
+    #[test]
+    fn voxel_axes_y_unchecked_cells_keyed_by_xz() {
+        // Axes X and Z (Y unchecked): cells are (x, 0, z). Splat pairs that
+        // differ only in Y share a cell; differing on X or Z stays separate.
+        let axes = VoxelAxes::from_flags(true, false, true);
+        let a1 = record(0.0, 0.0, 0.0, 0.1); // cell (0, 0, 0)
+        let a2 = record(0.1, 1.2, 0.2, 0.2); // same cell (same X and Z)
+        let b1 = record(0.3, 9.5, 0.1, 0.3); // same cell (0, 0, 0)
+        let b2 = record(2.0, 0.5, 2.0, 0.4); // cell (4, 0, 4): separate
+        let (out, n, _, _) = run_voxel_axes(
+            &[
+                Some(vec![a1.clone(), a2.clone()]),
+                Some(vec![b1, b2.clone()]),
+            ],
+            axes,
+        )
+        .unwrap();
+        // A wins the shared cell 2:1 (b1 dropped); b2 keeps its own cell.
+        assert_eq!(n, 3);
+        let mut expected = a1;
+        expected.extend(a2);
+        expected.extend(b2);
+        assert_eq!(body_of(&out), expected);
+    }
+
+    #[test]
+    fn voxel_axes_y_only() {
+        // Only Y enabled: cells are (0, y, 0). Records differing only in X or
+        // Z share a cell; a differing Y stays separate.
+        let axes = VoxelAxes::from_flags(false, true, false);
+        let a1 = record(0.0, 0.0, 0.0, 0.1); // cell (0, 0, 0)
+        let a2 = record(3.0, 0.0, 4.0, 0.2); // same cell: Y equal
+        let b1 = record(1.0, 1.5, 1.0, 0.3); // cell (0, 3, 0): separate
+        let (out, n, _, _) = run_voxel_axes(
+            &[Some(vec![a1.clone(), a2.clone()]), Some(vec![b1.clone()])],
+            axes,
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        let mut expected = a1;
+        expected.extend(a2);
+        expected.extend(b1);
         assert_eq!(body_of(&out), expected);
     }
 
@@ -591,6 +664,7 @@ mod tests {
         let res = merge_voxel(
             &sources,
             0.5,
+            VoxelAxes::all(),
             &ia.raw_header,
             &mut out,
             &mut prog,

@@ -217,11 +217,12 @@ pub fn run_with(
         .join(", ");
     let _ = writeln!(
         log,
-        "Run started (inputs: {}; base: {}; output: {}; voxel size: {}; threshold: {})",
+        "Run started (inputs: {}; base: {}; output: {}; voxel size: {}; voxel axes: {}; threshold: {})",
         inputs,
         args.base.as_deref().unwrap_or("-"),
         args.output,
         args.voxel_size,
+        args.voxel_axes.label(),
         args.threshold
     );
     match run_steps(args, out, &mut log, cancel) {
@@ -328,6 +329,14 @@ fn run_steps(
     // 3. Shared stride and header template (errors on mismatch / all '-').
     let header = header_template(&inputs, base.as_ref())?;
 
+    // The voxel step only runs with 2+ inputs and needs at least one
+    // enabled axis (set via the GUI checkboxes; the CLI always has all).
+    if inputs.len() >= 2 && !args.voxel_axes.any() {
+        return Err(error_msg(
+            "No voxel axis enabled (at least one of X, Y, Z required)",
+        ));
+    }
+
     let (temp1, temp2) = temp_paths(&args.output)?;
     let _temp_guard = TempGuard::new(temp1.clone(), temp2);
     let mut writer = BufWriter::new(File::create(&args.output)?);
@@ -343,6 +352,7 @@ fn run_steps(
             merge::merge_voxel(
                 &sources,
                 args.voxel_size,
+                args.voxel_axes,
                 &header,
                 &mut temp_writer,
                 prog,
@@ -374,6 +384,7 @@ fn run_steps(
             merge::merge_voxel(
                 &sources,
                 args.voxel_size,
+                args.voxel_axes,
                 &header,
                 &mut writer,
                 prog,
@@ -501,6 +512,7 @@ mod tests {
             output: output.to_string_lossy().into_owned(),
             voxel_size: 0.5,
             threshold: 1.0f32.exp(),
+            voxel_axes: crate::VoxelAxes::all(),
         }
     }
 
@@ -704,6 +716,29 @@ mod tests {
     }
 
     #[test]
+    fn no_voxel_axis_enabled_errors() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("noaxes");
+        let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.1)]);
+        let b = write_ply(&dir, "b.ply", &[record(0.2, 0.2, 0.2, 0.2)]);
+        let out = dir.path("out.ply");
+        let mut a2 = args(&format!("{},{}", a, b), None, &out);
+        a2.voxel_axes = crate::VoxelAxes::from_flags(false, false, false);
+        let err = run(&a2).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "No voxel axis enabled (at least one of X, Y, Z required)"
+        );
+        // The guard fires before the output file is created.
+        assert!(!out.exists());
+        // The run log is kept, with the terminal failure line.
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Run failed after"));
+        assert!(rlog.contains("No voxel axis enabled (at least one of X, Y, Z required)"));
+        assert!(!rlog.contains("Run finished"));
+    }
+
+    #[test]
     fn truncated_data_errors() {
         let _lock = shared_log_lock();
         let dir = TmpDir::new("truncated");
@@ -845,7 +880,7 @@ mod tests {
         let out_str = out.to_string_lossy().into_owned();
         let expected = vec![
             format!(
-                "Run started (inputs: {a_str}; base: -; output: {out_str}; voxel size: 0.5; threshold: 2.7182817)"
+                "Run started (inputs: {a_str}; base: -; output: {out_str}; voxel size: 0.5; voxel axes: XYZ; threshold: 2.7182817)"
             ),
             format!("Input 1: {a_str} ({in_sz}, 2 splats)"),
             "Passthrough started".to_string(),
@@ -885,6 +920,7 @@ mod tests {
                 output: out.to_string_lossy().into_owned(),
                 voxel_size: 0.5,
                 threshold: 1.0f32.exp(),
+                voxel_axes: crate::VoxelAxes::all(),
             },
             &mut sink,
             &NEVER,
@@ -942,7 +978,7 @@ mod tests {
         let out_str = out.to_string_lossy().into_owned();
         let expected = vec![
             format!(
-                "Run started (inputs: {a}, {b}; base: {base}; output: {out_str}; voxel size: 0.5; threshold: 2.7182817)"
+                "Run started (inputs: {a}, {b}; base: {base}; output: {out_str}; voxel size: 0.5; voxel axes: XYZ; threshold: 2.7182817)"
             ),
             format!("Input 1: {a} ({}, 2 splats)", sz(&a)),
             format!("Input 2: {b} ({}, 2 splats)", sz(&b)),

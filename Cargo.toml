@@ -3,9 +3,15 @@ name = "splat-merge"
 version = "0.1.0"
 edition = "2021"
 
+# Test-only (Windows): the e2e debug-rendering test runs the winit event loop
+# on the test worker thread, which on Windows needs the `any_thread` opt-in.
+[target.'cfg(windows)'.dev-dependencies]
+winit = "0.30"
+
 [dependencies]
 memmap2 = "0.9"
 clap = { version = "4.0", features = ["derive"] }
 hashbrown = "0.14"
 eframe = "0.37"
 rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

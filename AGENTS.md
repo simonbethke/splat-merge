@@ -73,6 +73,13 @@ Output rules:
 - Cover every case listed in the docs section "Required test cases" when touching related logic.
 - New behavior and bug fixes require a test. For bugs: write the failing test first.
 
+## GUI verification
+- A GUI task (any change to layout, theming, or widget state) is not finished
+  until the agent has created a state JSON per the docs "Debug rendering"
+  section, run `cargo run --release -- --debug-render <state.json>`, and
+  visually compared `screenshot.jpg` against the docs "GUI" section.
+- Screenshots are evidence: do not claim a GUI change looks right without one.
+
 ## Performance
 - Never claim a speedup without measuring before and after on the same input.
 - No new dependencies or parallelism (`rayon`) without asking.

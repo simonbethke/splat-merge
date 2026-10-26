@@ -27,6 +27,10 @@ desktop.ini
 *.ply
 # Ignore potential log files
 *.log
+# Debug-render verification artifacts (working state from the docs example,
+# and the screenshot overwritten on every `--debug-render` run)
+state.json
+screenshot.jpg
 
 # --- Cargo Lock ---
 # For binary applications (like this tool), it is actually 

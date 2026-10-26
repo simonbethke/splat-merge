@@ -15,6 +15,11 @@ into one larger splat.
 
 ### voxel (density merge)
 - Space is divided into cubes of `--voxel-size` (0.5 = 50 cm).
+- The cell axes are selectable (GUI only — the "Voxels: X, Y, Z" checkboxes,
+  see "GUI"; all on by default): an unchecked axis is not part of the cell
+  key, so only the checked axes define the cells (e.g. X and Z only means the
+  cells are extruded along Y). With one axis only, the cells span all space
+  orthogonal to it. The CLI has no flag for this and always uses all three axes.
 - Per voxel, the input with the most splats in that voxel wins: its splats there
   are kept and the splats of all other inputs in that voxel are dropped
   (XOR by density).
@@ -52,15 +57,17 @@ given) is `-`, the run is rejected with an error (no file to supply stride and h
 - Inputs are never loaded fully into RAM: mmap for reading, buffered writer for output.
 
 ## Invocation
-One executable, two modes:
+One executable, three modes:
 - **No arguments**: launches the GUI window (see "GUI").
-- **One or more arguments**: CLI mode with the flags below.
+- **`--debug-render <state.json>`**: debug-render mode — renders the named GUI
+  state to `screenshot.jpg` and exits (see "Debug rendering").
+- **Any other arguments**: CLI mode with the flags below.
 
 Windows: the binary is linked with the GUI subsystem
 (`#![windows_subsystem = "windows"]`), so double-clicking it (no arguments)
-opens only the window, no console. CLI mode requires an existing console
-(e.g. cmd / PowerShell); running it without one is an error, which is not
-reachable by double-clicking.
+opens only the window, no console. CLI mode and `--debug-render` require an
+existing console (e.g. cmd / PowerShell); running them without one is an error,
+which is not reachable by double-clicking.
 
 ## CLI
 | Flag | Meaning |
@@ -70,10 +77,13 @@ reachable by double-clicking.
 | `-o, --output <file>` | Output PLY |
 | `-v, --voxel-size <f>` | Cube edge length for the voxel step (default: `0.5`) |
 | `-t, --threshold <f>` | Max-scale threshold for the scale step (default: `0.01`) |
+| `--debug-render <file>` | Debug-render mode: render a documented GUI state to `screenshot.jpg` and exit (see "Debug rendering"); conflicts with all pipeline flags |
 
 Input list entries are trimmed of surrounding whitespace; an empty entry (e.g. `a,,b`)
 is an error. `--mode` no longer exists: the voxel step always runs on the input list, and
 the scale step runs when `--base` is a real file (`--base -` = no base; see "Pipeline").
+The voxel-axis selection is GUI-only (see "GUI"); CLI runs always merge on all
+three axes.
 
 ## Typical workflow
 ```bash
@@ -96,7 +106,9 @@ Layout, top to bottom:
    visible rounded box with the theme's 1px border, inset 16px from the
    window edges. Below it a control row — "Add" (multi-select picker) and
    "Remove" (enabled only while a list entry is selected) on the left, and
-   the voxel-size chooser right-aligned on the right.
+   the voxel-axis checkboxes "Voxels: X", "Y", "Z" (all checked by default;
+they select which axes define the voxel cells — an unchecked axis is ignored),
+then the voxel-size chooser right-aligned on the right.
 2. Base-file field (single-file picker via a "Browse" button; an empty base
    means no base, like omitting `--base`). The field expands to the remaining
    width of the row; the "Browse" button and the scale-threshold chooser are
@@ -115,8 +127,8 @@ Layout, top to bottom:
 Theme and spacing:
 - Dark theme, applied once at startup (independent of the system theme).
 - Every interactive widget - the file list rows, the Base and Output text
-  inputs, all buttons and the choosers - gets a visible 1px border that
-  defines its area.
+  inputs, the voxel-axis checkboxes, all buttons and the choosers - gets a
+  visible 1px border that defines its area.
 - 8px spacing between all elements.
 - The content is padded against the window edges with a 16px inset on all
   sides.
@@ -131,8 +143,8 @@ Files:
 
 Run:
 - Validation before start: at least one input, a `.ply` output path, voxel size > 0,
-  threshold >= 0. On failure the reason is shown in a message dialog and nothing
-  starts.
+  threshold >= 0, and at least one voxel axis (X, Y or Z) checked. On failure the
+  reason is shown in a message dialog and nothing starts.
 - While a run is active, the controls above are disabled and the pipeline's
   lines (the same lines the CLI would print on stdout) are interpreted:
   progress lines move the bar of their table column, and every other line is
@@ -146,6 +158,61 @@ Run:
   settings are preserved, so a rerun is immediate.
 - The run log (see "Run log") is written exactly as in the CLI: `splat-merge.log`
   beside the executable.
+
+## Debug rendering
+For scriptable, deterministic GUI verification (see the "GUI verification"
+agent rule): `--debug-render <state.json>` loads a documented JSON state object,
+renders the window (per "GUI") once at the state's size in the same dark theme,
+saves `screenshot.jpg` in the current working directory (overwritten on each
+run, JPEG quality 90), and exits. It never starts the pipeline, never writes the
+run log, and never opens native dialogs.
+
+On success it prints `Saved screenshot.jpg (<w>x<h>)` to stdout and exits 0.
+Any failure (missing/unreadable state file, bad JSON, or a rule violation below)
+prints one clear error line to stderr naming the offending field and value, and
+exits non-zero.
+
+State object (a top-level JSON object; exactly this set of fields):
+
+| Field | Type | Optional | Default | Meaning |
+|---|---|---|---|---|
+| `version` | integer | required | must be `1` | Format version; any other value is an error |
+| `window` | object `{"width": int, "height": int}` | yes | `1000`, `700` | Render size in pixels; each value must be `>= 100` |
+| `inputs` | array of strings | yes | `[]` | Input list entries, in order (any string; `.ply` is not enforced in debug mode) |
+| `selected_input` | integer or `null` | yes | `null` | 0-based index into `inputs`; when set, must be in range; renders the entry selected and "Remove" enabled |
+| `voxel_axes` | object `{"x": bool, "y": bool, "z": bool}` | yes | all `true` | The three voxel-axis checkboxes |
+| `voxel_size` | number | yes | `0.5` | Voxel-size chooser value; must be `> 0` |
+| `base` | string | yes | `""` | Base-file field text |
+| `output` | string | yes | `""` | Output-file field text |
+| `progress` | object `{"mapping": int, "merging": int, "cleaning": int}` | yes | all `0` | The three progress-bar percentages, each `0`–`100` |
+| `running` | bool | yes | `false` | `true` renders the running state: controls disabled and the Run button shows "Abort" |
+
+Rules:
+- Unknown fields at any level are rejected with an error naming the offending
+  field, so a bad state file fails fast instead of silently rendering the wrong
+  state.
+- Wrong types and out-of-range values are errors with clear messages. Integer
+  fields accept integral numbers only; a non-integral number is a type error.
+- Message dialogs, drag-and-drop, and in-run pipeline behavior are out of scope
+  for the state object; rendering is a single static frame.
+
+Example state file (`state.json`):
+```json
+{
+  "version": 1,
+  "window": { "width": 1000, "height": 700 },
+  "inputs": ["detail_a.ply", "detail_b.ply"],
+  "selected_input": 0,
+  "voxel_axes": { "x": true, "y": true, "z": false },
+  "voxel_size": 0.5,
+  "base": "base.ply",
+  "output": "merged.ply",
+  "progress": { "mapping": 100, "merging": 20, "cleaning": 0 },
+  "running": false
+}
+```
+Run it with `cargo run --release -- --debug-render state.json` and compare the
+resulting `screenshot.jpg` against the "GUI" section.
 
 ## Pipeline
 A run executes these steps in order:
@@ -171,6 +238,9 @@ Errors:
 - Empty input-list entry, or all data sources `-`: error (nothing to read).
 - Mismatched stride between any non-empty file: error (property layouts differ;
   a byte-exact merge is impossible).
+- 2+ inputs with no voxel axis enabled (the GUI checkboxes; the CLI always
+  has all) — guard for the voxel step: error
+  `No voxel axis enabled (at least one of X, Y, Z required)`.
 
 Cancellation (GUI abort; not reachable from the CLI):
 - The merge loops check a shared cancel flag at each record; when it is set the
@@ -231,7 +301,9 @@ lines below go to the log only; they never reach the CLI stdout or the GUI
 message dialogs.
 
 Line sequence (in order):
-- `Run started (inputs: <list>; base: <name or "-">; output: <path>; voxel size: <v>; threshold: <t>)`
+- `Run started (inputs: <list>; base: <name or "-">; output: <path>; voxel size: <v>; voxel axes: <axes>; threshold: <t>)`,
+  where `<axes>` is the compact enabled-axis set in XYZ order (`XYZ` when all
+  axes are enabled, e.g. `XZ` when only X and Z).
 - One line per input slot: `Input <n>: <name> (<size>, <count> splats)`;
   an empty slot (`-`) reads `Input <n>: - (empty)`.
 - If a base was given: `Base: <name> (<size>, <count> splats)` (or
@@ -255,14 +327,24 @@ with one decimal (`1.5k`, `12.3M`, `2.0B`); durations are `<n>s`,
 `<n>m <nn>s`, `<n>h <nn>m <nn>s`.
 
 ## Architecture
-Single binary (CLI or GUI — see "Invocation"). Dependencies: `clap` (CLI), `memmap2`
-(input mapping), `hashbrown` (voxel density maps), `eframe` 0.37 / `egui` (GUI window),
-`rfd` 0.17 (native file dialogs in the GUI).
+Single binary (CLI, GUI, or debug rendering — see "Invocation"). Dependencies:
+`clap` (CLI), `memmap2` (input mapping), `hashbrown` (voxel density maps),
+`eframe` 0.37 / `egui` (GUI window), `rfd` 0.17 (native file dialogs in the
+GUI), `image` (JPEG encoding for debug rendering only — never in the pipeline).
+Test-only dev-dependency: `winit` 0.30 (Windows) — the e2e debug-rendering
+test sets `with_any_thread` on the event-loop builder so the window can be
+created on the test worker thread.
 
 Source layout:
-- `src/main.rs`: clap-derived `Args` (the shared CLI argument struct); `main` launches
-  the GUI when the binary is started without arguments (see "Invocation"), otherwise
-  parses the args and calls `pipeline::run`.
+- `src/main.rs`: `Cli` — the clap parser for the pipeline flags (see "CLI")
+  plus `--debug-render <state.json>` (see "Debug rendering"); combining
+  `--debug-render` with any pipeline flag is a parse error
+  (clap `conflicts_with`); `Args` — the plain settings struct the pipeline
+  and the GUI's run start read; `VoxelAxes` — the voxel-axis mask (X/Y/Z bits,
+  default all axes on; not a CLI flag, set from the GUI checkboxes, and the
+  default in the CLI); `main` dispatches: no arguments → the GUI (see
+  "Invocation"), `--debug-render <file>` → debug rendering (see "Debug
+  rendering"), otherwise builds the `Args` and calls `pipeline::run`.
 - `src/ply.rs`: `PlyInfo` + `parse_ply_header`, `validate`, `get_pos`, `get_max_scale`,
   and `rewrite_header` (reconstructed output header).
 - `src/merge.rs`: `merge_voxel` (all non-empty inputs in one run: one density map per
@@ -281,13 +363,32 @@ Source layout:
   unterminated final line on drop; the log formatters `format_utc`, `format_bytes`,
   `format_splats`, `format_duration` (see "Run log").
 - `src/gui.rs`: `eframe`/`egui` window per the "GUI" section (`launch` is the GUI
-  entry point). `is_ply` extension check; `add_input` (`.ply` + duplicate rejection,
+  entry point). `GuiState` — the plain settings struct (inputs, selection, voxel
+  axes, voxel size, threshold, base, output, progress, running) the window
+  renders from; its `Default` equals the GUI's startup defaults, and the same
+  struct drives debug rendering (a superset: `threshold` is in the window but
+  not in the state object). `is_ply` extension check; `add_input` (`.ply` + duplicate rejection,
   returning the rejection message for a dialog); `ChanWriter` (an `io::Write` sink
   forwarding complete lines over an mpsc channel); `parse_progress_line`
   (recognizes the three progress lines, yielding column + percentage; any other
-  line becomes a message dialog); `start_run` (validation returning the first
-  failed rule, then the worker thread with a shared cancel flag); the abort
+  line becomes a message dialog); `start_run_error` (validates the settings, returning the first failed rule — including at least one
+  checked voxel axis — without starting anything, so it is unit-testable) and `start_run` (calls it,
+  then starts the worker thread with a shared cancel flag); the abort
   confirmation dialog and the per-line message dialogs.
+- `src/debug_render.rs`: debug rendering (see "Debug rendering"). Parses the
+  state file — hand-written recursive-descent JSON, validated strictly against
+  the documented schema (unknown fields rejected naming the field, wrong types
+  and out-of-range values are errors) — into `gui::GuiState`. Renders one real
+  `eframe` window with that state (egui 0.37 has no headless pixel API) and
+  requests the painted frame's pixels through egui's screenshot callback
+  (`Context::request_screenshot`, delivered asynchronously on a wgpu thread and
+  silently dropped on GPU error), self-correcting the pixel size to the
+  requested `width x height` via `ViewportCommand::InnerSize`. Encodes the
+  captured pixels as RGB8 JPEG (quality 90) with `image` into `screenshot.jpg`
+  in the current working directory (overwritten), then closes the window. A
+  bounded deadline turns a dropped callback into a timeout error instead of a
+  hang. On success prints `Saved screenshot.jpg (<w>x<h>)` to stdout and exits
+  0; any failure prints one error line to stderr and exits non-zero.
 - `src/pipeline.rs`: input-list parsing, file mapping/validation, stride check,
   single voxel step (to the output, or to temp1 then re-map when a scale step
   follows), scale step, passthrough, cleanup. `run` (CLI) locks stdout and delegates
@@ -300,7 +401,21 @@ Source layout:
   partial output (see "Pipeline" — Cancellation).
 
 Responsibilities by item:
-- `Args`: clap-derived CLI (flags in the "CLI" section).
+- `Cli` (main.rs): the clap command line (flags in the "CLI" section);
+  `--debug-render <file>` is its own flag, conflicting with every pipeline
+  flag (see "Debug rendering") — the pipeline flags are required only when
+  it is absent.
+- `Args` (main.rs): the plain pipeline-settings struct the pipeline (and the
+  GUI's run start) read; `voxel_axes` carries the `VoxelAxes` mask for the run.
+- `VoxelAxes`: the enabled voxel-axis set as a bit mask (`X` = 1, `Y` = 2,
+  `Z` = 4); `Default` is all three; `any()` reports whether any axis is
+  enabled and `label()` renders the compact enabled set (`XYZ`, `XZ`, `Y`, …)
+  used by the `Run started` log line and the GUI.
+- `GuiState` (gui.rs): the settings struct the GUI renders from; `Default`
+  equals the GUI's startup defaults (all axes on, voxel size 0.5, threshold
+  0.01, empty inputs/base/output, zero progress, not running); its fields map
+  1:1 onto the window's widgets, and it is also the target struct of the
+  `--debug-render` state object (a superset — `threshold` is not in the JSON).
 - `PlyInfo` + `parse_ply_header`: scans the ASCII header; computes the per-splat byte
   stride from the `property` declarations (`float` = 4, `double` = 8, `uchar`/`uint8` = 1
   byte), stores the vertex count, records the byte offset of `scale_0`, and keeps the raw
@@ -313,7 +428,9 @@ Responsibilities by item:
   log values, exponentiated to world space.
 - `merge_voxel`: merges all non-empty inputs in one run into any `Write` target
   (temp or output). Mapping phase: one hashbrown map per input counts per-voxel
-  density, keyed by `(x, y, z)` i32 voxel indices (`floor(p / voxel_size)`). The
+  density, keyed by `(x, y, z)` i32 voxel indices (`floor(p / voxel_size)`),
+  with a disabled axis's component forced to 0 (see "Modes" — voxel); the
+  all-axes case is unchanged. The
   per-voxel winner (max count, ties → earliest input) and the kept count (sum of
   the winning counts) are derived from the maps, so the reconstructed header
   (all source header lines except `element vertex`, rewritten with the final
@@ -364,6 +481,11 @@ GUI helper cases in `src/gui.rs`.
 - Voxel with 3 inputs: per-voxel winner is the earliest input at the max count;
   3+ inputs merge in a single run with kept splats in input-list order
 - Voxel keys for negative coordinates
+- Voxel axis subsets: a disabled axis is excluded from the cell key, so splats
+  differing only in that axis share one cell (e.g. Y unchecked → cells keyed by
+  X and Z only: splats differing only in Y collapse into one cell, while ones
+  differing on X or Z stay separate; the same holds for any enabled subset);
+  the all-axes case is byte-identical to the previous behavior
 - Threshold boundary: `<` goes to file 1, `>=` to file 2
 - Output header vertex count equals the number of written splats
 - Kept splat records are byte-identical to the input
@@ -387,6 +509,10 @@ GUI helper cases in `src/gui.rs`.
 - GUI: `is_ply` accepts a `.ply`/`.PLY` name and rejects other or missing
   extensions; `ChanWriter` forwards only complete lines, in order, keeping a
   trailing partial line until `flush`
+- GUI: `start_run` is rejected with the documented message when no voxel axis
+  is checked (and accepts the run when at least one is)
+- No voxel axis enabled with 2+ inputs: the run errors before the output file
+  is created, and the run log carries the documented `Run failed` line
 - GUI: `parse_progress_line` maps the three progress line formats to
   (column, percentage) and returns `None` for `Success:` / abort / other lines
 - Run log: a successful run writes `splat-merge.log` beside the executable with the
@@ -406,6 +532,17 @@ GUI helper cases in `src/gui.rs`.
 - Run log: `LogFile` emits complete lines as they arrive (a trailing partial line
   is written only on drop, stamped); `format_utc`, `format_bytes`, `format_splats`
   and `format_duration` produce the documented forms
+- Debug rendering: a minimal state JSON parses to the documented defaults; all
+  fields accepted; `version` != 1 (or missing) rejected; each unknown field,
+  each wrong type, and each out-of-range value (progress > 100, negative
+  `voxel_size`, window dim < 100, `selected_input` out of range) rejected with
+  an error naming the field and value
+- Debug rendering: `GuiState` maps to the GUI's settings exactly (checkbox
+  states, field texts, bar percentages, running/disabled state)
+- Debug rendering: the default state renders to a valid non-empty JPEG at the
+  documented default 1000x700; a custom `window` size is honored
+- CLI: `--debug-render` combined with any pipeline flag (`-i`/`--base`/`-o`/`-v`/`-t`)
+  fails at parse time
 
 ## Open questions
 - README calls the threshold "1cm³ (0.01)", but the described comparison uses max axis
@@ -417,6 +554,24 @@ GUI helper cases in `src/gui.rs`.
 
 ## Changelog
 
+- 2026-10-26 Debug rendering (task 5): new `--debug-render <state.json>` mode —
+  renders a documented JSON GUI state (`version` 1; `window` size `>= 100` px,
+  default 1000x700; `inputs`; `selected_input`; `voxel_axes`; `voxel_size`;
+  `base`; `output`; `progress` 0–100; `running`) to `screenshot.jpg` (JPEG q90,
+  CWD, overwritten) and exits, printing `Saved screenshot.jpg (<w>x<h>)` on
+  success; strict validation rejects unknown fields, wrong types and
+  out-of-range values, naming the offending field and value. The GUI now
+  renders from a shared `GuiState` (see "Architecture"); `image` added for
+  JPEG encoding, with `winit` 0.30 as a test-only dev-dependency (the e2e test
+   runs the event loop on the test worker thread); interactive GUI behavior
+   unchanged.
+- 2026-10-25 GUI: "Voxels: X, Y, Z" checkboxes (all checked by default) select
+  which axes define the voxel cells; an unchecked axis's key component is 0, so
+  the cells are extruded along it (e.g. Y unchecked → cells keyed by X and Z).
+  GUI-only — the CLI has no flag and always uses all three axes, whose keys and
+  output are byte-identical to the previous behavior. The `Run started` log
+  line gains a `voxel axes: <axes>` field (`XZ`, `Y`, …), and the GUI rejects a
+  run with no axis checked.
 - 2026-10-25 Run log: the log file is now always `splat-merge.log` beside the
   executable (previously `<output-stem>.log` beside the output); progress lines
   no longer appear in the log (only the phase start and finish lines do); line
