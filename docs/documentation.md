@@ -105,10 +105,12 @@ Layout, top to bottom:
    window height (it scrolls if the entries do not fit). The list itself is a
    visible rounded box with the theme's 1px border, inset 16px from the
    window edges. Below it a control row — "Add" (multi-select picker) and
-   "Remove" (enabled only while a list entry is selected) on the left, and
-   the voxel-axis checkboxes "Voxels: X", "Y", "Z" (all checked by default;
-they select which axes define the voxel cells — an unchecked axis is ignored),
-then the voxel-size chooser right-aligned on the right.
+   "Remove" (enabled only while a list entry is selected) on the left.
+   Below that a second control row holds the voxel settings: the
+   voxel-axis checkboxes "Voxels: X", "Y", "Z" (all checked by default;
+they select which axes define the voxel cells — an unchecked axis is ignored)
+   on the left, and the "Voxel size:" label with its chooser
+   right-aligned at the end of the row.
 2. Base-file field (single-file picker via a "Browse" button; an empty base
    means no base, like omitting `--base`). The field expands to the remaining
    width of the row; the "Browse" button and the scale-threshold chooser are
@@ -118,17 +120,24 @@ then the voxel-size chooser right-aligned on the right.
    row.
 4. Progress table: it spans the full window width in three equal-width
    columns. Two rows — a header row with the column names "Mapping",
-   "Merging" and "Cleaning" (bold, centered), and a row of three progress
-   bars, one per column, each bar showing its current percentage painted
-   centered inside it. The bars are 0% before a run, move as progress lines
-   arrive, and keep their last value after the run ends.
-5. Run button at the very bottom of the window, aligned to the right.
+   "Merging" and "Cleaning" (larger, centered), and a row of three progress
+   bars, one per column. Each bar is a full-width track with the theme's
+   1px border and a left-anchored accent fill sized to the value; the
+   percentage is painted centered over the track. The bars are 0% before a
+   run, move as progress lines arrive, and keep their last value after the
+   run ends.
+5. A prominent filled Run button (accent blue — the app's primary action,
+   larger than the other buttons) at the very bottom of the window, aligned
+   to the right. While a run is active it reads "Abort" in a danger red.
 
 Theme and spacing:
 - Dark theme, applied once at startup (independent of the system theme).
 - Every interactive widget - the file list rows, the Base and Output text
   inputs, the voxel-axis checkboxes, all buttons and the choosers - gets a
   visible 1px border that defines its area.
+- The Run button is filled with an accent blue (the app's primary action) and
+  the progress-bar fills use the same accent; while a run is active the
+  "Abort" button is filled with a danger red.
 - 8px spacing between all elements.
 - The content is padded against the window edges with a 16px inset on all
   sides.
@@ -554,6 +563,14 @@ GUI helper cases in `src/gui.rs`.
 
 ## Changelog
 
+- 2026-10-26 GUI polish: the control row is split into two grouped rows (list
+  actions Add/Remove; and the voxel axis checkboxes with the voxel-size
+  chooser right-aligned), so nothing collides at the minimum window width; the
+  progress bars are restyled as full-width tracks with a left-anchored accent
+  fill and the percentage centered over the track (no more bare pills/dots at
+  low values); the Run button is a prominent filled accent button and reads a
+  filled red "Abort" while running. Layout/appearance only, no behavior
+  changes.
 - 2026-10-26 Debug rendering (task 5): new `--debug-render <state.json>` mode —
   renders a documented JSON GUI state (`version` 1; `window` size `>= 100` px,
   default 1000x700; `inputs`; `selected_input`; `voxel_axes`; `voxel_size`;

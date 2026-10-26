@@ -399,8 +399,15 @@ impl Gui {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.state.running {
                         // Abort: confirm natively, then set the cancel flag.
+                        // Filled danger red so it reads as a warning action.
                         if ui
-                            .add_enabled(!self.aborting, egui::Button::new("Abort"))
+                            .add_enabled(
+                                !self.aborting,
+                                egui::Button::new("Abort")
+                                    .fill(DANGER)
+                                    .corner_radius(6.0)
+                                    .min_size(egui::vec2(96.0, 38.0)),
+                            )
                             .clicked()
                         {
                             let result = rfd::MessageDialog::new()
@@ -415,7 +422,15 @@ impl Gui {
                                 self.aborting = true;
                             }
                         }
-                    } else if ui.button("Run").clicked() {
+                    } else if ui
+                        .add(
+                            egui::Button::new("Run")
+                                .fill(ACCENT)
+                                .corner_radius(6.0)
+                                .min_size(egui::vec2(96.0, 38.0)),
+                        )
+                        .clicked()
+                    {
                         if let Some(reason) = self.start_run() {
                             show_message(rfd::MessageLevel::Error, &reason);
                         }
@@ -431,8 +446,10 @@ impl Gui {
             .show(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.add_enabled_ui(!self.state.running, |ui| self.settings_rows(ui));
-                    ui.separator();
                     // Layout 4: the 3x2 progress table (docs "GUI", layout 4).
+                    // The space above it is the plain 8px item margin (docs
+                    // "GUI" theme says no separator lines), so it reads as a
+                    // clean gap, not a line.
                     self.progress_table(ui);
                 });
             });
@@ -452,6 +469,14 @@ const EDGE_PAD: i8 = 16;
 /// Gap between the bottom-anchored panels (docs "GUI", theme: 8px spacing
 /// between elements).
 const ROW_GAP: i8 = 8;
+
+/// The app's accent blue: fills the Run button and the progress bars
+/// (docs "GUI", theme — the primary action).
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(48, 112, 205);
+
+/// The danger red: fills the "Abort" button while a run is active
+/// (docs "GUI", theme).
+const DANGER: egui::Color32 = egui::Color32::from_rgb(205, 72, 72);
 
 impl Gui {
     /// Layout 1 of the docs section "GUI": the input file list, one entry
@@ -480,11 +505,10 @@ impl Gui {
     }
 
     /// The setting rows of the docs section "GUI", layouts 1-3: the
-    /// Add/Remove/voxel control row, then the base row, then the output row,
-    /// each on its own full-width row.
+    /// Add/Remove control row, the voxel-settings row, then the base row,
+    /// then the output row, each on its own full-width row.
     fn settings_rows(&mut self, ui: &mut egui::Ui) {
-        // Layout 1, control row: Add/Remove on the left, the voxel-size
-        // chooser on the right.
+        // Layout 1, first control row: Add/Remove — the list actions.
         ui.horizontal(|ui| {
             if ui.button("Add").clicked() {
                 self.pick_inputs();
@@ -496,8 +520,12 @@ impl Gui {
                 }
                 self.state.selected = None;
             }
-            // The checked axes define the voxel cells; an unchecked axis is
-            // ignored (docs "GUI" layout 1 and "Modes — voxel").
+        });
+        // Layout 1, second control row: the voxel settings — the axis
+        // checkboxes (which define the voxel cells; an unchecked axis is
+        // ignored, docs "GUI" layout 1 and "Modes — voxel") on the left,
+        // and the voxel-size chooser right-aligned at the end of the row.
+        ui.horizontal(|ui| {
             ui.checkbox(&mut self.state.axes[0], "Voxels: X");
             ui.checkbox(&mut self.state.axes[1], "Voxels: Y");
             ui.checkbox(&mut self.state.axes[2], "Voxels: Z");
@@ -579,11 +607,18 @@ impl Gui {
     /// Layout 4 of the docs "GUI" section: a two-row, three-column progress
     /// table spanning the full available width in equal-width columns —
     /// bold centered headers ("Mapping", "Merging", "Cleaning") above one
-    /// progress bar per column, with the percentage painted centered inside
-    /// the bar.
+    /// full-width track bar per column. Each bar is a track with the theme's
+    /// 1px border and a left-anchored accent fill sized to its value; the
+    /// percentage is painted centered over the whole track.
     fn progress_table(&mut self, ui: &mut egui::Ui) {
         let gap = ui.spacing().item_spacing.x;
         let col = (ui.available_width() - 2.0 * gap) / 3.0;
+        let text_color = ui
+            .visuals()
+            .override_text_color
+            .unwrap_or(ui.visuals().text_color());
+        let track = egui::Color32::from_gray(50);
+        let border = ui.visuals().widgets.inactive.bg_stroke;
         ui.vertical(|ui| {
             ui.horizontal(|ui| {
                 for name in ["Mapping", "Merging", "Cleaning"] {
@@ -596,25 +631,37 @@ impl Gui {
                         egui::Align2::CENTER_CENTER,
                         name,
                         egui::FontId::new(15.0, egui::FontFamily::Proportional),
-                        ui.visuals()
-                            .override_text_color
-                            .unwrap_or(ui.visuals().text_color()),
+                        text_color,
                     );
                 }
             });
             ui.horizontal(|ui| {
                 for &pct in self.state.progress.iter() {
-                    let rect = ui
-                        .add(egui::ProgressBar::new(pct as f32 / 100.0).desired_width(col))
-                        .rect;
-                    ui.painter().with_clip_rect(rect).text(
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(col, 22.0), egui::Sense::hover());
+                    // Track: a full-width rounded rect, slightly lighter than
+                    // the panel fill, framed by the theme's 1px border.
+                    ui.painter().rect_filled(rect, 6.0, track);
+                    // Accent fill, left-anchored and sized to the value
+                    // (painted over the track, so a tiny value still shows).
+                    if pct > 0 {
+                        let width = (col * (pct as f32) / 100.0).max(1.0);
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(rect.min, egui::vec2(width, rect.height())),
+                            6.0,
+                            ACCENT,
+                        );
+                    }
+                    ui.painter()
+                        .rect_stroke(rect, 6.0, border, egui::epaint::StrokeKind::Middle);
+                    // The percentage sits over the whole track, whether the
+                    // fill reaches it or not.
+                    ui.painter().text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         format!("{pct}%"),
                         egui::FontId::new(13.0, egui::FontFamily::Proportional),
-                        ui.visuals()
-                            .override_text_color
-                            .unwrap_or(ui.visuals().text_color()),
+                        text_color,
                     );
                 }
             });
