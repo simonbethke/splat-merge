@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "window": { "width": 1000, "height": 700 },
+  "inputs": ["detail_a.ply", "detail_b.ply", "detail_c.ply", "detail_d.ply"],
+  "selected_input": null,
+  "voxel_axes": { "x": true, "y": true, "z": false },
+  "voxel_size": 0.5,
+  "base": "base.ply",
+  "output": "merged.ply",
+  "progress": { "mapping": 100, "merging": 45, "cleaning": 0 },
+  "running": true
+}

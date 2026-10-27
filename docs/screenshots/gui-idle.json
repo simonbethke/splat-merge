@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "window": { "width": 1000, "height": 700 },
+  "inputs": [],
+  "selected_input": null,
+  "voxel_axes": { "x": true, "y": true, "z": true },
+  "voxel_size": 0.5,
+  "base": "",
+  "output": "",
+  "progress": { "mapping": 0, "merging": 0, "cleaning": 0 },
+  "running": false
+}

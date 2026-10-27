@@ -122,7 +122,9 @@ Layout, top to bottom:
 1. Input file list: full width, one entry per line, filling all remaining
    window height (it scrolls if the entries do not fit). The list itself is a
    visible rounded box with the theme's 1px border, inset 16px from the
-   window edges. Below it a control row — "Add" (multi-select picker) and
+   window edges. When the list is empty, a hint line `No input files. Use Add,
+or drag .ply files onto the window.` is shown at the top of the box.
+    Below it a control row — "Add" (multi-select picker) and
    "Remove" (enabled only while a list entry is selected) on the left.
    Below that a second control row holds the voxel settings: the
    voxel-axis checkboxes "Voxels: X", "Y", "Z" (all checked by default;
@@ -257,6 +259,13 @@ Example state file (`state.json`):
 ```
 Run it with `cargo run --release -- --debug-render state.json` and compare the
 resulting `screenshot.jpg` against the "GUI" section.
+
+The GUI screenshots committed for the README live in `docs/screenshots/`: one
+state file per image (`gui-idle.json`, `gui-configured.json`,
+`gui-running.json`) plus the rendered `gui-<name>.jpg`. Regenerate any image
+with `cargo run --release -- --debug-render docs/screenshots/gui-<name>.json`
+(from the repository root) and copy `screenshot.jpg` over
+`docs/screenshots/gui-<name>.jpg`.
 
 ## Pipeline
 A run executes these steps in order:
@@ -659,6 +668,12 @@ GUI helper cases in `src/gui.rs`.
   empty file 2" (keep only file 1's splats under the threshold).
 
 ## Changelog
+
+- 2026-10-27 README: restructured for GitHub with three GUI screenshots
+  (idle, configured, running) generated from state files committed in
+  `docs/screenshots/` (see "Debug rendering" — state files); the "GUI" section
+  now also documents the empty-list hint line; documentation only, no behavior
+  changes.
 
 - 2026-10-27 Merge of files with differing property layouts (task 6): the
   output keeps the properties present in every non-empty data source (inputs +
