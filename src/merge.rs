@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::logfile::{format_duration, format_splats};
-use crate::ply::{get_max_scale, get_pos, rewrite_header, PlyInfo};
+use crate::ply::{
+    get_max_scale, get_pos, is_identity, map_layout, rewrite_header, PlyInfo, Property, Seg,
+};
 use crate::progress::Progress;
 use crate::VoxelAxes;
 
@@ -76,21 +78,25 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), UserAborted> {
 /// earliest input (list order) with the most splats there; kept splats are
 /// written in input-list order, record order within each file.
 ///
-/// Writes the reconstructed header (from `header`, rewritten with the
-/// final count) followed by the kept records byte-exact. Progress phases
+/// Writes the reconstructed header (`header` trimmed to the `common`
+/// property lines, rewritten with the final count) followed by the kept
+/// records, remapped onto the common layout (each value byte-identical to
+/// the source). Progress phases
 /// `1 Mapping` (hashmaps filled) and `2 Merging (voxel based)` (selection and writing),
 /// per the "Progress" documentation section; the phase start/finish
 /// detail lines (with durations) go to `log`, per the "Run log" section.
 /// The `cancel` flag is checked per record/file (`UserAborted` error).
 /// Returns the number of splats written.
-// sources + voxel_size + axes + header + out/prog/log sinks + cancel make 8
-// parameters; a struct would obscure the positional-only call site.
+// sources + voxel_size + axes + header + common + out/prog/log sinks +
+// cancel make 9 parameters; a struct would obscure the positional-only
+// call site.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_voxel(
     sources: &[Option<(&[u8], &PlyInfo)>],
     voxel_size: f32,
     axes: VoxelAxes,
     header: &str,
+    common: &[Property],
     out: &mut impl Write,
     prog: &mut impl Write,
     log: &mut impl Write,
@@ -150,12 +156,22 @@ pub fn merge_voxel(
     }
 
     let mut prog2 = Progress::new("2 Merging (voxel based)", weights, totals);
-    rewrite_header(out, header, kept)?;
+    // Copy plans onto the common layout: identity sources copy a record in
+    // one slice; the rest are remapped property by property.
+    let out_stride: usize = common.iter().map(|p| p.size).sum();
+    let plans: Vec<Vec<Seg>> = sources
+        .iter()
+        .map(|s| s.map_or(Vec::new(), |(_, i)| map_layout(i, common)))
+        .collect();
+    let mut out_buf = vec![0u8; out_stride];
+    let keep_names: Vec<&str> = common.iter().map(|p| p.name.as_str()).collect();
+    rewrite_header(out, header, kept, Some(&keep_names))?;
     for (f, src) in sources.iter().enumerate() {
         if let Some((m, i)) = *src {
             if maps[f].is_empty() {
                 continue;
             }
+            let identity = is_identity(&plans[f]);
             for idx in 0..i.vertex_count {
                 check_cancel(cancel)?;
                 if winner
@@ -167,7 +183,20 @@ pub fn merge_voxel(
                     .is_some_and(|wf| wf.0 == f)
                 {
                     let start = i.header_len + idx * i.stride;
-                    out.write_all(&m[start..start + i.stride])?;
+                    if identity {
+                        // Source layout already equals the common layout,
+                        // so the first out_stride bytes are the record.
+                        out.write_all(&m[start..start + out_stride])?;
+                    } else {
+                        // Remap every common property from its source offset
+                        // into one reusable buffer (fully covered by the
+                        // plan; no clear needed).
+                        for s in &plans[f] {
+                            out_buf[s.out..s.out + s.size]
+                                .copy_from_slice(&m[start + s.src..start + s.src + s.size]);
+                        }
+                        out.write_all(&out_buf)?;
+                    }
                 }
                 prog2.advance(f, 1, prog);
             }
@@ -235,20 +264,24 @@ fn count_kept(
 /// are written before file 2's. Errors `No scale in Input 1/2` when a
 /// present source declares no scale property.
 ///
-/// Writes the reconstructed header followed by the kept records
-/// byte-exact. Progress: only the `3 Cleaning (scale based)` phase; the
+/// Writes the reconstructed header (`header` trimmed to the `common`
+/// property lines, rewritten with the final count) followed by the kept
+/// records, remapped onto the common layout (each value byte-identical to
+/// the source). Progress: only the `3 Cleaning (scale based)` phase; the
 /// phase detail lines (counting marker, kept count, duration) go to `log`,
 /// per the "Run log" documentation section. The `cancel` flag is
 /// checked per record (`UserAborted` error). Returns the number of splats
 /// written.
-// Two sources + threshold + header + out/prog/log sinks + cancel make 8
-// parameters; a struct would obscure a positional-only call site.
+// Two sources + threshold + header + common + out/prog/log sinks +
+// cancel make 9 parameters; a struct would obscure a positional-only
+// call site.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_scale(
     src1: Option<(&[u8], &PlyInfo)>,
     src2: Option<(&[u8], &PlyInfo)>,
     threshold: f32,
     header: &str,
+    common: &[Property],
     out: &mut impl Write,
     prog: &mut impl Write,
     log: &mut impl Write,
@@ -289,18 +322,40 @@ pub fn merge_scale(
         format_splats(all)
     );
     let t2 = Instant::now();
-    rewrite_header(out, header, total)?;
+    // Copy plans onto the common layout (identity sources copy a record in
+    // one slice; the rest are remapped property by property).
+    let out_stride: usize = common.iter().map(|p| p.size).sum();
+    let plans = [
+        src1.map_or(Vec::new(), |(_, i)| map_layout(i, common)),
+        src2.map_or(Vec::new(), |(_, i)| map_layout(i, common)),
+    ];
+    let mut out_buf = vec![0u8; out_stride];
+    let keep_names: Vec<&str> = common.iter().map(|p| p.name.as_str()).collect();
+    rewrite_header(out, header, total, Some(&keep_names))?;
 
     let mut prog2 = Progress::new("3 Cleaning (scale based)", weights, totals.to_vec());
     for (f, src) in [src1, src2].into_iter().enumerate() {
         if let Some((m, i)) = src {
             if let Some(off) = i.scale_offset {
                 let below = f == 0;
+                let identity = is_identity(&plans[f]);
                 for idx in 0..i.vertex_count {
                     check_cancel(cancel)?;
                     if scale_passes(m, i, idx, off, below, threshold) {
                         let start = i.header_len + idx * i.stride;
-                        out.write_all(&m[start..start + i.stride])?;
+                        if identity {
+                            // Source layout already equals the common layout,
+                            // so the first out_stride bytes are the record.
+                            out.write_all(&m[start..start + out_stride])?;
+                        } else {
+                            // Remap every common property from its source
+                            // offset into one reusable buffer.
+                            for s in &plans[f] {
+                                out_buf[s.out..s.out + s.size]
+                                    .copy_from_slice(&m[start + s.src..start + s.src + s.size]);
+                            }
+                            out.write_all(&out_buf)?;
+                        }
                     }
                     prog2.advance(f, 1, prog);
                 }
@@ -319,7 +374,7 @@ pub fn merge_scale(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ply::parse_ply_header;
+    use crate::ply::{common_layout, parse_ply_header};
 
     /// Property block of an 11-float record (x, y, z, opacity,
     /// scale_0..2, rot_0..3), matching the project's fixture layout.
@@ -348,6 +403,26 @@ mod tests {
         .into_bytes();
         out.extend_from_slice(body);
         out
+    }
+
+    /// As `ply`, but with a caller-supplied `props` block (for mixed-layout tests).
+    fn ply_props(count: usize, props: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\n{}end_header\n",
+            count, props
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// One 5-float record: x, y, z, opacity, scale_0 (in the caller's order).
+    fn rec5(x: f32, y: f32, z: f32, opacity: f32, s0: f32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(20);
+        for v in [x, y, z, opacity, s0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
     }
 
     /// The body of a merge output (everything after the parsed header).
@@ -392,12 +467,14 @@ mod tests {
             .first()
             .map(|(_, i)| i.raw_header.clone())
             .unwrap_or_default();
+        let infos: Vec<&PlyInfo> = pairs.iter().map(|(_, i)| i).collect();
+        let common = common_layout(&infos).unwrap().0;
         let mut out = Vec::new();
         let mut prog = Vec::new();
         let mut log = Vec::new();
         let nc = AtomicBool::new(false);
         let n = merge_voxel(
-            &sources, 0.5, axes, &header, &mut out, &mut prog, &mut log, &nc,
+            &sources, 0.5, axes, &header, &common, &mut out, &mut prog, &mut log, &nc,
         )?;
         Ok((
             out,
@@ -425,12 +502,18 @@ mod tests {
         let mut log = Vec::new();
         let src1: Option<(&[u8], &PlyInfo)> = Some((&b1[..], &i1));
         let src2: Option<(&[u8], &PlyInfo)> = pair2.as_ref().map(|(b, i)| (b.as_slice(), i));
+        let mut infos: Vec<&PlyInfo> = vec![&i1];
+        if let Some((_, i2)) = &pair2 {
+            infos.push(i2);
+        }
+        let common = common_layout(&infos).unwrap().0;
         let nc = AtomicBool::new(false);
         let n = merge_scale(
             src1,
             src2,
             1.0f32.exp(),
             &i1.raw_header,
+            &common,
             &mut out,
             &mut prog,
             &mut log,
@@ -632,12 +715,15 @@ mod tests {
         let b2 = ply(1, &r2);
         let i2 = parse_ply_header(&b2);
 
+        let infos = [&i1, &i2];
+        let common = common_layout(&infos).unwrap().0;
         let nc = AtomicBool::new(false);
         let res = merge_scale(
             Some((&b1, &i1)),
             Some((&b2, &i2)),
             0.01,
             &i2.raw_header,
+            &common,
             &mut Vec::new(),
             &mut Vec::new(),
             &mut Vec::new(),
@@ -657,6 +743,8 @@ mod tests {
         let ia = parse_ply_header(&ba);
         let ib = parse_ply_header(&bb);
         let sources: [Option<(&[u8], &PlyInfo)>; 2] = [Some((&ba[..], &ia)), Some((&bb[..], &ib))];
+        let infos = [&ia, &ib];
+        let common = common_layout(&infos).unwrap().0;
         let cancel = AtomicBool::new(true);
         let mut out = Vec::new();
         let mut prog = Vec::new();
@@ -666,6 +754,7 @@ mod tests {
             0.5,
             VoxelAxes::all(),
             &ia.raw_header,
+            &common,
             &mut out,
             &mut prog,
             &mut log,
@@ -696,11 +785,14 @@ mod tests {
         let mut out = Vec::new();
         let mut prog = Vec::new();
         let mut log = Vec::new();
+        let infos = [&ia, &ib];
+        let common = common_layout(&infos).unwrap().0;
         let res = merge_scale(
             Some((&ba[..], &ia)),
             Some((&bb[..], &ib)),
             1.0f32.exp(),
             &ia.raw_header,
+            &common,
             &mut out,
             &mut prog,
             &mut log,
@@ -715,5 +807,76 @@ mod tests {
         let logtext = String::from_utf8(log).unwrap();
         assert!(logtext.contains("counting kept splats"));
         assert!(!logtext.contains("started"));
+    }
+
+    #[test]
+    fn mixed_layout_kept_records_remap_to_first_input_order() {
+        // a: x, y, z, opacity, scale_0 (20B). b: x, y, z, scale_0, opacity
+        // (20B, opacity/scale_0 swapped). All five records fall into voxel
+        // (0,0,0); b wins 3:2, its records remapped into a's property order.
+        const PROPS_A: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float opacity\nproperty float scale_0\n";
+        const PROPS_B: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float scale_0\nproperty float opacity\n";
+        let a = [rec5(0.0, 0.0, 0.0, 0.1, 1.0), rec5(0.4, 0.3, 0.2, 0.2, 2.0)];
+        let b = [
+            rec5(0.1, 0.1, 0.1, 0.3, 3.0),
+            rec5(0.2, 0.0, 0.0, 0.4, 4.0),
+            rec5(0.3, 0.0, 0.0, 0.5, 5.0),
+        ];
+        let body_a: Vec<u8> = a.iter().flatten().copied().collect();
+        let body_b: Vec<u8> = b.iter().flatten().copied().collect();
+        let ba = ply_props(2, PROPS_A, &body_a);
+        let bb = ply_props(3, PROPS_B, &body_b);
+        let ia = parse_ply_header(&ba);
+        let ib = parse_ply_header(&bb);
+        let sources = [Some((&ba[..], &ia)), Some((&bb[..], &ib))];
+        let infos = [&ia, &ib];
+        let (common, dropped) = common_layout(&infos).unwrap();
+        assert!(dropped.is_empty());
+        assert_eq!(
+            common.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["x", "y", "z", "opacity", "scale_0"]
+        );
+        let mut out = Vec::new();
+        let mut prog = Vec::new();
+        let mut log = Vec::new();
+        let nc = AtomicBool::new(false);
+        let n = merge_voxel(
+            &sources,
+            0.5,
+            VoxelAxes::all(),
+            &ia.raw_header,
+            &common,
+            &mut out,
+            &mut prog,
+            &mut log,
+            &nc,
+        )
+        .unwrap();
+        assert_eq!(n, 3);
+        // Header: a's property order, b's count, 20-byte stride.
+        let oi = parse_ply_header(&out);
+        assert_eq!(oi.vertex_count, 3);
+        assert_eq!(oi.stride, 20);
+        assert_eq!(
+            oi.properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y", "z", "opacity", "scale_0"]
+        );
+        // Body: b's records in a's order — [x,y,z @ 0..12] +
+        // [opacity @ b 16..20] + [scale_0 @ b 12..16].
+        let remapped: Vec<u8> = b
+            .iter()
+            .flat_map(|r| {
+                let mut o = r[..12].to_vec();
+                o.extend_from_slice(&r[16..20]);
+                o.extend_from_slice(&r[12..16]);
+                o
+            })
+            .collect();
+        assert_eq!(body_of(&out), remapped);
     }
 }

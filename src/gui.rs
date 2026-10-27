@@ -8,6 +8,7 @@
 //! rendering is available to `crate::debug_render`, which renders a
 //! documented GUI state from a JSON file (docs section "Debug rendering").
 
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use memmap2::Mmap;
+
+use crate::ply::{common_layout, parse_ply_header, PlyInfo};
 
 /// Launches the GUI window; runs until the window is closed.
 pub fn launch() -> Result<(), Box<dyn std::error::Error>> {
@@ -225,9 +229,33 @@ impl Gui {
             return Some(reason);
         }
         let base = self.state.base.trim().to_owned();
+        let base_opt = if base.is_empty() { None } else { Some(base) };
+        // Pre-start layout check (docs "GUI" — Run): a conflicting PLY type
+        // or an invalid `x`,`y`,`z` order fails without starting; a
+        // non-empty drop list asks a native Ok/Cancel question, and Cancel
+        // means the run does not start.
+        let inputs: Vec<&str> = self.state.inputs.iter().map(String::as_str).collect();
+        match layout_check(&inputs, base_opt.as_deref()) {
+            LayoutCheck::Equal => {}
+            LayoutCheck::Drops(dropped) => {
+                let confirmed = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("Dropped properties")
+                    .set_description(format!(
+                        "Some properties are not present in every input file and will be dropped from the output: {}",
+                        dropped.join(", ")
+                    ))
+                    .set_buttons(rfd::MessageButtons::OkCancel)
+                    .show();
+                if confirmed != rfd::MessageDialogResult::Ok {
+                    return None;
+                }
+            }
+            LayoutCheck::Error(msg) => return Some(msg),
+        }
         let args = crate::Args {
             inputs: self.state.inputs.join(","),
-            base: if base.is_empty() { None } else { Some(base) },
+            base: base_opt,
             output: self.state.output.trim().to_owned(),
             voxel_size: self.state.voxel_size,
             threshold: self.state.threshold,
@@ -253,14 +281,15 @@ impl Gui {
     }
 
     /// Drains the lines produced so far by the worker thread: progress lines
-    /// update the progress table; every other line is shown as a message
-    /// dialog (level per `message_level`).
+    /// update the progress table; the drop-notification line (already
+    /// confirmed before the run started) is skipped; every other line is
+    /// shown as a message dialog (level per `message_level`).
     fn drain_lines(&mut self) {
         if let Some(rx) = self.rx.as_ref() {
             while let Ok(line) = rx.try_recv() {
                 if let Some((col, pct)) = parse_progress_line(&line) {
                     self.state.progress[col] = pct;
-                } else {
+                } else if !is_drop_notification(&line) {
                     show_message(message_level(&line), &line);
                 }
             }
@@ -686,8 +715,17 @@ fn parse_progress_line(line: &str) -> Option<(usize, u32)> {
     Some((col, pct))
 }
 
-/// Maps a pipeline line to its dialog level: `Success:` lines are
-/// information, the abort line a warning, everything else an error.
+/// Whether the line is the pipeline's drop-notification (docs "Pipeline"
+/// — Errors): the user already confirmed the drops before the run started
+/// (docs "GUI" — Run), so `drain_lines` skips it instead of re-showing it
+/// as a dialog.
+fn is_drop_notification(line: &str) -> bool {
+    line.starts_with("Dropped properties not present in every file: ")
+}
+
+/// Maps a pipeline line to its dialog level: the `Success:` line is
+/// information, the abort line a warning, everything else an error. (The
+/// drop-notification line never reaches here: `drain_lines` skips it.)
 fn message_level(line: &str) -> rfd::MessageLevel {
     if line.starts_with("Success:") {
         rfd::MessageLevel::Info
@@ -695,6 +733,78 @@ fn message_level(line: &str) -> rfd::MessageLevel {
         rfd::MessageLevel::Warning
     } else {
         rfd::MessageLevel::Error
+    }
+}
+
+/// Maps one PLY file to its parsed header, opening it read-only (docs
+/// "GUI" — Run, layout check): an unreadable file, or a header with no
+/// `end_header` line, is an error the start path shows in an error dialog.
+fn probe_header(path: &str) -> Result<PlyInfo, String> {
+    let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mmap = unsafe {
+        // SAFETY: `file` stays open for the lifetime of the mapping, so
+        // the mapped bytes remain valid while the header is parsed.
+        Mmap::map(&file).map_err(|e| format!("{path}: {e}"))?
+    };
+    // Only the first 64 KiB can hold a sane ASCII header; bounding the
+    // scan also keeps a missing `end_header` from dragging the whole
+    // binary body through the UTF-8 line scanner.
+    let head = &mmap[..mmap.len().min(64 * 1024)];
+    let stop = head
+        .windows(11)
+        .position(|w| w == b"end_header\n")
+        .map(|p| p + 11)
+        .or_else(|| {
+            head.windows(12)
+                .position(|w| w == b"end_header\r\n")
+                .map(|p| p + 12)
+        })
+        .ok_or_else(|| {
+            format!("{path}: the PLY header is incomplete or invalid (no `end_header` line)")
+        })?;
+    Ok(parse_ply_header(&head[..std::cmp::min(stop, head.len())]))
+}
+
+/// The `start_run` layout-check outcome (docs "GUI" — Run).
+#[derive(Debug)]
+enum LayoutCheck {
+    /// Every non-empty source declares the same properties (nothing drops).
+    Equal,
+    /// These properties (first source's order) are absent from at least one
+    /// non-empty source and would be dropped from the output.
+    Drops(Vec<String>),
+    /// The run must not start; the message is the documented error text,
+    /// shown in an error dialog.
+    Error(String),
+}
+
+/// Compares the property layouts of the non-empty data sources (`inputs`
+/// plus the optional `base`), probing each file read-only: an unreadable
+/// file, an invalid `x`,`y`,`z` order, or a conflicting PLY type is an
+/// error naming its cause; otherwise the names that would be dropped (in
+/// first-source order) are listed, or `Equal` when no property drops.
+fn layout_check(inputs: &[&str], base: Option<&str>) -> LayoutCheck {
+    let mut infos = Vec::new();
+    for s in inputs.iter().copied().chain(base) {
+        let t = s.trim();
+        if t.is_empty() || t == "-" {
+            continue;
+        }
+        match probe_header(t) {
+            Ok(i) => infos.push(i),
+            Err(msg) => return LayoutCheck::Error(msg),
+        }
+    }
+    if infos.is_empty() {
+        // No real files to compare: `start_run_error` requires at least one
+        // input, and the pipeline reports the all-empty error afterwards.
+        return LayoutCheck::Equal;
+    }
+    let refs: Vec<&PlyInfo> = infos.iter().collect();
+    match common_layout(&refs) {
+        Ok((_, dropped)) if dropped.is_empty() => LayoutCheck::Equal,
+        Ok((_, dropped)) => LayoutCheck::Drops(dropped),
+        Err(msg) => LayoutCheck::Error(msg),
     }
 }
 
@@ -909,5 +1019,174 @@ mod tests {
             (inner.max.y - (outer.max.y - m)).abs() <= 0.5,
             "{inner:?} vs {outer:?}"
         );
+    }
+
+    /// One header line in the test PLY files (shared by the layout-check
+    /// cases below).
+    const HDR_OPA: &str = "PLY\nformat binary_little_endian 1.0\nelement vertex 1\n\
+                          property float x\nproperty float y\nproperty float z\n\
+                          property float opacity\nend_header\n";
+    const HDR_OPA_DETAIL: &str = "PLY\nformat binary_little_endian 1.0\nelement vertex 1\n\
+                                 property float x\nproperty float y\nproperty float z\n\
+                                 property float opacity\nproperty float detail\n\
+                                 property float scale_0\nend_header\n";
+    const HDR_SCALE: &str = "PLY\nformat binary_little_endian 1.0\nelement vertex 1\n\
+                            property float x\nproperty float y\nproperty float z\n\
+                            property float scale_0\nend_header\n";
+    const HDR_OPA_CHAR: &str = "PLY\nformat binary_little_endian 1.0\nelement vertex 1\n\
+                               property float x\nproperty float y\nproperty float z\n\
+                               property uchar opacity\nend_header\n";
+    const HDR_BAD_ORDER: &str = "PLY\nformat binary_little_endian 1.0\nelement vertex 1\n\
+                                property float opacity\nproperty float x\nproperty float y\n\
+                                property float z\nend_header\n";
+
+    /// Writes a small PLY (header + body bytes) into a shared test
+    /// directory and returns its path — the layout-check tests never need
+    /// real data files.
+    fn tmp_ply(name: &str, header: &str, body: &[u8]) -> String {
+        let dir = std::env::temp_dir().join("splat-merge-gui-layout-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        let mut buf = header.as_bytes().to_vec();
+        buf.extend_from_slice(body);
+        std::fs::write(&p, buf).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// The test bodies: little-endian float bytes (the layout check only
+    /// reads the header, the values just size the records).
+    fn float_body(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn probe_header_reads_valid_and_rejects_bad_files() {
+        let body = float_body(&[0.0, 0.0, 0.0, 0.5]);
+        let ok = tmp_ply("gui-probe-valid.ply", HDR_OPA, &body);
+        let i = probe_header(&ok).expect("valid file");
+        assert_eq!(i.vertex_count, 1);
+        assert_eq!(i.stride, 16);
+        assert_eq!(
+            i.properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y", "z", "opacity"]
+        );
+
+        let incomplete = tmp_ply(
+            "gui-probe-incomplete.ply",
+            "PLY\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\n",
+            &[0u8; 32],
+        );
+        let err = probe_header(&incomplete).err().expect("incomplete header");
+        assert!(
+            err.contains("end_header"),
+            "expected the end_header error, got {err}"
+        );
+
+        let missing = std::env::temp_dir()
+            .join("splat-merge-gui-layout-tests")
+            .join("definitely-missing.ply")
+            .to_string_lossy()
+            .into_owned();
+        assert!(probe_header(&missing).is_err());
+    }
+
+    #[test]
+    fn layout_check_equal_layouts() {
+        let body = float_body(&[0.0, 0.0, 0.0, 0.5]);
+        let a = tmp_ply("gui-layout-eq-a.ply", HDR_OPA, &body);
+        let b = tmp_ply("gui-layout-eq-b.ply", HDR_OPA, &body);
+        assert!(matches!(
+            layout_check(&[a.as_str(), b.as_str()], None),
+            LayoutCheck::Equal
+        ));
+        // The base takes part in the comparison too.
+        assert!(matches!(
+            layout_check(&[a.as_str(), b.as_str()], Some(a.as_str())),
+            LayoutCheck::Equal
+        ));
+    }
+
+    #[test]
+    fn layout_check_drops_listed_in_first_source_order() {
+        let body = float_body(&[0.0, 0.0, 0.0, 0.5]);
+        // a: x, y, z, opacity, detail, scale_0; b: x, y, z, scale_0.
+        let a = tmp_ply("gui-layout-drop-a.ply", HDR_OPA_DETAIL, &body);
+        let b = tmp_ply("gui-layout-drop-b.ply", HDR_SCALE, &body);
+        match layout_check(&[a.as_str(), b.as_str()], None) {
+            LayoutCheck::Drops(dropped) => {
+                assert_eq!(dropped, ["opacity".to_owned(), "detail".to_owned()])
+            }
+            other => panic!("expected a drop list, got {other:?}"),
+        }
+        // `-` and empty slots are skipped, and the base is compared too.
+        match layout_check(&["-", a.as_str(), b.as_str()], None) {
+            LayoutCheck::Drops(dropped) => {
+                assert_eq!(dropped, ["opacity".to_owned(), "detail".to_owned()])
+            }
+            other => panic!("expected a drop list, got {other:?}"),
+        }
+        assert!(matches!(
+            layout_check(&[a.as_str(), b.as_str()], Some("")),
+            LayoutCheck::Drops(_)
+        ));
+    }
+
+    #[test]
+    fn layout_check_conflicting_type_is_an_error() {
+        let body = float_body(&[0.0, 0.0, 0.0, 0.5]);
+        let a = tmp_ply("gui-layout-conflict-a.ply", HDR_OPA, &body);
+        // b's `opacity` is a uchar byte instead of a float.
+        let mut bbody = float_body(&[0.0, 0.0, 0.0]);
+        bbody.push(200u8);
+        let b = tmp_ply("gui-layout-conflict-b.ply", HDR_OPA_CHAR, &bbody);
+        match layout_check(&[a.as_str(), b.as_str()], None) {
+            LayoutCheck::Error(msg) => {
+                assert_eq!(
+                    msg,
+                    "Property 'opacity' has conflicting PLY types between files (float vs uchar)"
+                );
+            }
+            other => panic!("expected the conflict error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn layout_check_bad_xyz_order_is_an_error() {
+        let body = float_body(&[0.0, 0.0, 0.0, 0.5]);
+        let a = tmp_ply("gui-layout-order-a.ply", HDR_OPA, &body);
+        let b = tmp_ply("gui-layout-order-b.ply", HDR_BAD_ORDER, &body);
+        match layout_check(&[a.as_str(), b.as_str()], None) {
+            LayoutCheck::Error(msg) => assert_eq!(
+                msg,
+                "Every file must declare x, y, z as the first three properties"
+            ),
+            other => panic!("expected the order error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_level_maps_pipeline_lines() {
+        assert!(matches!(
+            message_level("Success: 5 splats saved to a.ply"),
+            rfd::MessageLevel::Info
+        ));
+        // The drop-notification is no dialog at all — it is skipped.
+        assert!(is_drop_notification(
+            "Dropped properties not present in every file: opacity, detail"
+        ));
+        assert!(!is_drop_notification(
+            "Dropped properties present in every file: opacity"
+        ));
+        assert!(matches!(
+            message_level("Aborted; temporary and partial output files removed."),
+            rfd::MessageLevel::Warning
+        ));
+        assert!(matches!(
+            message_level("Run failed after 3 Cleaning (scale based): 100% (2.0M splats): boom"),
+            rfd::MessageLevel::Error
+        ));
     }
 }

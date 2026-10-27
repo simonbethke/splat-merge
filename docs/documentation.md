@@ -49,9 +49,23 @@ given) is `-`, the run is rejected with an error (no file to supply stride and h
 ## Binary format rules (must not break)
 - PLY data is binary little-endian with a fixed per-splat stride
   (position, SH, opacity, scale, rotation).
-- Kept splat records are copied byte-exact; output preserves the exact stride and property layout.
-- Output header is reconstructed from the source header: all lines are emitted
-  unchanged except `element vertex <count>`, which is rewritten with the final count.
+- `x`, `y`, `z` must be the first three properties of every non-empty data
+  source; the pipeline reads the position from the record start (any other
+  order is an error before the run starts).
+- The output layout is the common layout: the properties present in every
+  non-empty data source (inputs + `--base`), in the order of the first such
+  file. Properties present in only some files are dropped from the output
+  (no zero-fill); the drop is announced (see "CLI" and "GUI" — Run). A shared
+  property declared with a different byte size (PLY type) in different files
+  is an error naming the property (see "Pipeline" — Errors).
+- Kept splat records keep their property values byte-exact: with equal input
+  layouts the full record is copied as-is; with mixed layouts each kept
+  property is copied from its per-source offset to its output offset (the
+  same property may sit at different positions in different files).
+- Output header is reconstructed from the first non-empty file's header: all
+  lines are emitted unchanged except `element vertex <count>` (rewritten with
+  the final count) and the `property` lines of dropped properties (removed);
+  a single-input passthrough emits the source header as-is.
 - Scale properties are stored as log values. World-space scale = `exp(scale_n)`;
   "max scale" = maximum over the three axes.
 - Inputs are never loaded fully into RAM: mmap for reading, buffered writer for output.
@@ -84,6 +98,10 @@ is an error. `--mode` no longer exists: the voxel step always runs on the input 
 the scale step runs when `--base` is a real file (`--base -` = no base; see "Pipeline").
 The voxel-axis selection is GUI-only (see "GUI"); CLI runs always merge on all
 three axes.
+Mixed property layouts (the non-empty data sources declare different
+`property` sets) are merged by dropping the properties present in only some
+files; there is no new flag and no confirmation — exactly one notification
+line is written to stdout at run start (see "Pipeline" — Errors).
 
 ## Typical workflow
 ```bash
@@ -154,11 +172,28 @@ Run:
 - Validation before start: at least one input, a `.ply` output path, voxel size > 0,
   threshold >= 0, and at least one voxel axis (X, Y or Z) checked. On failure the
   reason is shown in a message dialog and nothing starts.
+- Layout check before start: the property sets of the non-empty data sources
+  (inputs + base) are compared; each file is only opened and memory-mapped
+  read-only to parse its ASCII header (nothing else is read or written), so
+  an unreadable file or a missing `end_header` is an error dialog too. Then:
+  - a shared property with conflicting PLY types, or `x`, `y`, `z` not the
+    first three properties of a non-empty file: error dialog with the message
+    (see "Pipeline" — Errors); the run does not start;
+  - properties present in only some files: a native Ok/Cancel dialog with the
+    question `Some properties are not present in every input file and will be
+    dropped from the output:` plus the dropped names (comma-joined); Ok =
+    start the run, Cancel = nothing starts and the controls stay enabled;
+  - equal layouts: the run starts as today.
+  The confirmation dialog is reachable only interactively: `--debug-render`
+  never starts a run, so a screenshot can show the run state (progress bars,
+  button) but never the dialog itself.
 - While a run is active, the controls above are disabled and the pipeline's
   lines (the same lines the CLI would print on stdout) are interpreted:
   progress lines move the bar of their table column, and every other line is
-  shown as a native message dialog - `Success:` as information, the abort line
-  as a warning, everything else as an error.
+  shown as a native message dialog — the `Success:` line as information, the
+  abort line as a warning, everything else as an error. The drop-notification
+  line is never shown as a dialog: the user already confirmed the drops in
+  the pre-start Ok/Cancel dialog.
 - The Run button becomes "Abort". Clicking it opens a native are-you-sure dialog;
   on confirmation the cancel flag is set, the run stops at the next record
   boundary, and the temp files plus the partially written output file are removed
@@ -244,12 +279,26 @@ Temporary files:
   a temp file produces a warning, not an error.
 
 Errors:
-- Empty input-list entry, or all data sources `-`: error (nothing to read).
-- Mismatched stride between any non-empty file: error (property layouts differ;
-  a byte-exact merge is impossible).
+- Empty input-list entry, or all data sources `-`: error (nothing to read);
+  fires before the output file is created.
+- A shared property declared with a different byte size (PLY type) in
+  different non-empty files: error before the output file is created —
+  `Property '<name>' has conflicting PLY types between files (<type A> vs <type B>)`.
+- `x`, `y`, `z` not the first three properties of a non-empty data source:
+  error before the output file is created (the pipeline reads the position
+  from the record start).
 - 2+ inputs with no voxel axis enabled (the GUI checkboxes; the CLI always
   has all) — guard for the voxel step: error
   `No voxel axis enabled (at least one of X, Y, Z required)`.
+- Properties present in only some non-empty files are **not** an error:
+  exactly one notification line is written to the output sink at run start,
+  before any progress line, with the names in first-input order —
+  `Dropped properties not present in every file: <n1>, <n2>, …` — it is
+  sink-only (in the GUI it appears as an information dialog during the run,
+  see "GUI" — Run; it never reaches the run log), and the run proceeds. A
+  scale step after such a merge still needs scale properties: when a present
+  source has none, it errors with `No scale in Input 1` / `No scale in Input 2`
+  before writing any record (temp files are still removed).
 
 Cancellation (GUI abort; not reachable from the CLI):
 - The merge loops check a shared cancel flag at each record; when it is set the
@@ -304,8 +353,9 @@ as they are complete, so a crashed or aborted run leaves a complete record of
 everything that happened before it.
 
 The log does not contain progress lines — for each phase it carries only the
-phase start and finish detail lines — and it does not contain the `Success:`
-or abort sink lines (the log has its own terminal lines instead). The detail
+phase start and finish detail lines — and it does not contain the `Success:`,
+drop-notification, or abort sink lines (the log has its own terminal lines
+instead). The detail
 lines below go to the log only; they never reach the CLI stdout or the GUI
 message dialogs.
 
@@ -354,12 +404,20 @@ Source layout:
   default in the CLI); `main` dispatches: no arguments → the GUI (see
   "Invocation"), `--debug-render <file>` → debug rendering (see "Debug
   rendering"), otherwise builds the `Args` and calls `pipeline::run`.
-- `src/ply.rs`: `PlyInfo` + `parse_ply_header`, `validate`, `get_pos`, `get_max_scale`,
-  and `rewrite_header` (reconstructed output header).
+- `src/ply.rs`: `PlyInfo` (the parsed property list — name, type name, size,
+  record offset — plus stride, vertex count, raw header, `scale_0` offset) +
+  `parse_ply_header`, `validate`, `get_pos`, `get_max_scale`, `common_layout`
+  (the shared layout helper: the common layout in first-file order, the
+  dropped names, and the all-empty / `x,y,z`-first / type-conflict errors),
+  and `rewrite_header` (reconstructed output header, optionally with the
+  non-common `property` lines removed).
 - `src/merge.rs`: `merge_voxel` (all non-empty inputs in one run: one density map per
   input, per-voxel earliest-input-at-max wins, kept splats in input-list order) and
   `merge_scale` (single pass, threshold keep). Both write the reconstructed header
-  then the kept records byte-exact, checking the given cancel flag at each record
+  (with the `property` lines filtered to the common layout) then the kept records
+  with their values byte-exact — full-record copy for equal layouts, per-property
+  remap to the common offsets for mixed ones, no per-record allocation — checking
+  the given cancel flag at each record
   (`UserAborted` error — see "Pipeline" — Cancellation). Operate on byte slices, not
   files; emit progress through the given progress writer, and phase start/finish
   detail lines to the given log sink (see "Run log").
@@ -380,8 +438,8 @@ Source layout:
   returning the rejection message for a dialog); `ChanWriter` (an `io::Write` sink
   forwarding complete lines over an mpsc channel); `parse_progress_line`
   (recognizes the three progress lines, yielding column + percentage; any other
-  line becomes a message dialog); `start_run_error` (validates the settings, returning the first failed rule — including at least one
-  checked voxel axis — without starting anything, so it is unit-testable) and `start_run` (calls it,
+  line becomes a message dialog); `message_level` (the dialog level: `Success:` and the drop-notification line as info, the abort line as a warning, `Run failed` and everything else as an error); `probe_header` (maps one PLY read-only and parses its ASCII header); `layout_check` (before start, compares the non-empty sources' property sets to equal / would-be-dropped / conflict, the conflict naming the property and both types or the invalid `x`,`y`,`z` order); `start_run_error` (validates the settings, returning the first failed rule — including at least one
+  checked voxel axis — without starting anything, so it is unit-testable) and `start_run` (runs the pre-start layout check first: a conflict or invalid `x`,`y`,`z` order fails with the error dialog and no start, a non-empty drop list asks the native Ok/Cancel confirmation where Cancel does not start the run; then calls it,
   then starts the worker thread with a shared cancel flag); the abort
   confirmation dialog and the per-line message dialogs.
 - `src/debug_render.rs`: debug rendering (see "Debug rendering"). Parses the
@@ -398,7 +456,10 @@ Source layout:
   bounded deadline turns a dropped callback into a timeout error instead of a
   hang. On success prints `Saved screenshot.jpg (<w>x<h>)` to stdout and exits
   0; any failure prints one error line to stderr and exits non-zero.
-- `src/pipeline.rs`: input-list parsing, file mapping/validation, stride check,
+- `src/pipeline.rs`: input-list parsing, file mapping/validation, common-layout
+  resolution (intersection of the non-empty sources' properties in first-file
+  order, with the conflict / `x,y,z`-first / all-`-` checks and the one
+  drop-notification line on the sink when the layout shrinks),
   single voxel step (to the output, or to temp1 then re-map when a scale step
   follows), scale step, passthrough, cleanup. `run` (CLI) locks stdout and delegates
   to `run_with`, which also serves the GUI worker; progress lines and the final
@@ -425,31 +486,48 @@ Responsibilities by item:
   0.01, empty inputs/base/output, zero progress, not running); its fields map
   1:1 onto the window's widgets, and it is also the target struct of the
   `--debug-render` state object (a superset — `threshold` is not in the JSON).
-- `PlyInfo` + `parse_ply_header`: scans the ASCII header; computes the per-splat byte
-  stride from the `property` declarations (`float` = 4, `double` = 8, `uchar`/`uint8` = 1
-  byte), stores the vertex count, records the byte offset of `scale_0`, and keeps the raw
-  header used to re-emit the output header.
+- `PlyInfo` + `parse_ply_header`: scans the ASCII header; collects the ordered
+  property list (name, type name, size, offset within the record; property
+  lines with an unrecognized type are skipped, as before) and computes the
+  per-splat byte stride from it (`float` = 4, `double` = 8, `uchar`/`uint8` = 1
+  byte, …); stores the vertex count, records the byte offset of `scale_0`, and
+  keeps the raw header used to re-emit the output header.
 - `validate`: rejects non-empty files whose binary data length is not a multiple of the
   stride or is truncated below the declared record count.
 - `get_pos(record)`: decodes the first 12 bytes of a record as the little-endian f32
   position (assumes position is the first property; used for voxel keys).
 - `get_max_scale(record, offset)`: decodes `scale_0..2` and returns the max of the three
   log values, exponentiated to world space.
+- `common_layout(infos)`: the shared layout of the non-empty data sources: the
+  properties present in every one, in the first non-empty source's order, each
+  as `(name, type_name, size)` plus the per-source `src_offset` and the output
+  `out_offset` (from the first source's offsets); also returns the dropped
+  names in first-source order for the notification/confirmation. Errors before
+  the run: all sources `-`, a source not starting with `x`,`y`,`z`, or a shared
+  name with a different byte size (naming the property and both types).
+- `rewrite_header(writer, template, count, keep)`: re-emits the template
+  header unchanged except `element vertex <count>` and the `property` lines
+  whose names are not in `keep` (passthrough keeps all names).
 - `merge_voxel`: merges all non-empty inputs in one run into any `Write` target
   (temp or output). Mapping phase: one hashbrown map per input counts per-voxel
   density, keyed by `(x, y, z)` i32 voxel indices (`floor(p / voxel_size)`),
   with a disabled axis's component forced to 0 (see "Modes" — voxel); the
   all-axes case is unchanged. The
   per-voxel winner (max count, ties → earliest input) and the kept count (sum of
-  the winning counts) are derived from the maps, so the reconstructed header
-  (all source header lines except `element vertex`, rewritten with the final
-  count) can be written before any record. Merging phase: for each input in list
-  order, its winning records are copied byte-exact. Progress: `1 Mapping` and
+  the winning counts) are derived from the maps, so the output header can be
+  written before any record: `rewrite_header` re-emits the first non-empty
+  source's header with the final count on `element vertex` and drops the
+  `property` lines whose names are not in the common layout (none dropped when
+  the layouts are equal). Merging phase: for each input in list order, its
+  winning records are written with the copy rule (a full-record copy when the
+  source's layout equals the common layout, otherwise a per-property remap).
+  Progress: `1 Mapping` and
   `2 Merging (voxel based)` phases per the "Progress" section; the phase
   start/finish detail lines go to the given log sink (see "Run log").
 - `merge_scale`: single pass. Counts — then writes — the kept records: file 1
   kept on max world scale `< threshold`, file 2 kept on `>= threshold`, file 1's
-  splats followed by file 2's. Errors `No scale in Input 1/2` when a present
+  splats followed by file 2's, each record copied with the same rules as
+  `merge_voxel`. Errors `No scale in Input 1/2` when a present
   source declares no scale property. Progress: only the `3 Cleaning (scale based)`
   phase; the phase detail lines (including `counting kept splats`) go to the given
   log sink (see "Run log").
@@ -467,8 +545,10 @@ Responsibilities by item:
 - `pipeline::run`: CLI entry — locks stdout and delegates to `pipeline::run_with`
   with a never-set cancel flag.
 - `pipeline::run_with`: orchestrates per the "Pipeline" section — parses the input
-  list, maps each file (`-` = empty), validates, requires equal strides across
-  all non-empty files, runs the single voxel step (directly to the output, or to
+  list, maps each file (`-` = empty), validates, resolves the common layout (the `common_layout` entry: all-`-`,
+  `x`,`y`,`z`-first and type-conflict are errors before the output file exists;
+  a non-empty drop list writes the one notification line to the sink at run
+  start), runs the single voxel step (directly to the output, or to
   `temp1` then re-map when the scale step follows), then the scale step with
   `--base`, or the single-input passthrough (no progress). Progress lines and the
   final `Success:` line go to the given sink; on `UserAborted` the partially written
@@ -497,13 +577,30 @@ GUI helper cases in `src/gui.rs`.
   the all-axes case is byte-identical to the previous behavior
 - Threshold boundary: `<` goes to file 1, `>=` to file 2
 - Output header vertex count equals the number of written splats
-- Kept splat records are byte-identical to the input
+- Kept splat records: each property's value is byte-identical to the input
+  (the record may use the reordered common layout)
 - Malformed input (truncated data, `len % stride != 0`, missing scale property in the
   scale step) returns an error
 - Single input without `--base` yields a byte-identical passthrough copy
 - 2+ inputs merge in a single voxel step, followed (with `--base`) by the scale step
 - Temp files do not exist after the run (on success or on error)
-- Mismatched stride between non-empty files returns an error
+- Mixed property layouts: the output carries exactly the properties present in
+  every non-empty data source (inputs + `--base`), in the first non-empty
+  input's order, with each property's value byte-identical to the source; a
+  shared property sitting at different positions in different files is remapped
+  per-property into the common layout
+- Mixed property layouts: exactly one notification line naming the dropped
+  properties, written to the sink before `Success:`, absent from the run log,
+  and absent when all non-empty files share the same layout
+- Mixed property layouts: a shared property declared with a different PLY type
+  (byte size) in different files is an error before the run starts, naming the
+  property and both types; no output file is left behind
+- Mixed property layouts: a non-empty source whose first three properties are
+  not `x`, `y`, `z` is an error before the run starts
+- `--base` participates in the intersection: a property present in all inputs
+  but missing in the `--base` file is dropped from the output; when the base
+  drops a scale property the scale step fails with the documented
+  `No scale in Input 1/2` error and the temp files are still removed
 - Progress: a per-million line on each counter crossing; each phase ends with exactly
   one 100% line (no duplicate when the last boundary line already printed 100%)
 - Progress: weighted sub-progress matches the worked example (1M of 5M splats in a
@@ -563,6 +660,15 @@ GUI helper cases in `src/gui.rs`.
 
 ## Changelog
 
+- 2026-10-27 Merge of files with differing property layouts (task 6): the
+  output keeps the properties present in every non-empty data source (inputs +
+  `--base`), in the first non-empty input's order, dropping the rest (one
+  notification line on the sink in the CLI; in the GUI a native Ok/Cancel
+  confirmation before start, and the run does not re-show the notification
+  line as a dialog). A shared
+  property with a different PLY type, a source not starting with `x`,`y`,`z`,
+  and all-`-` data sources are pre-run errors; equal layouts keep the
+  byte-copy fast path and passthrough stays verbatim.
 - 2026-10-26 GUI polish: the control row is split into two grouped rows (list
   actions Add/Remove; and the voxel axis checkboxes with the voxel-size
   chooser right-aligned), so nothing collides at the minimum window width; the

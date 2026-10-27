@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use crate::logfile::{format_bytes, format_duration, format_splats, LogFile};
 use crate::merge::{self, UserAborted};
-use crate::ply::{parse_ply_header, rewrite_header, validate, PlyInfo};
+use crate::ply::{common_layout, parse_ply_header, rewrite_header, validate, PlyInfo, Property};
 use crate::Args;
 
 /// One mapped data source; an empty input (`-`) is represented by `None`.
@@ -37,31 +37,31 @@ fn src_of(inp: &Option<Input>) -> Option<(&[u8], &PlyInfo)> {
     inp.as_ref().map(|i| (&i.mmap[..], &i.info))
 }
 
-/// Requires equal strides across all non-empty sources and returns the
-/// header template (a copy of the first real file's raw header).
-fn header_template(
+/// Resolves the common layout (properties present in every non-empty
+/// source, in the first source's order, plus the dropped names) across all
+/// non-empty sources, or a pre-run error: all `-`, a source not starting
+/// with `x`, `y`, `z`, or a shared property with a conflicting PLY type.
+fn common_layout_of(
     inputs: &[Option<Input>],
     base: Option<&Input>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut stride = None;
-    let mut header = None;
-    for inp in inputs.iter().flatten().chain(base) {
-        match stride {
-            None => {
-                stride = Some(inp.info.stride);
-                header = Some(inp.info.raw_header.clone());
-            }
-            Some(s) if s != inp.info.stride => {
-                return Err(
-                    "Stride mismatch between input files (different property layouts)".into(),
-                );
-            }
-            Some(_) => {}
-        }
-    }
-    header.ok_or_else(|| {
-        "All data sources are '-' (empty); provide at least one real PLY file".into()
-    })
+) -> Result<(Vec<Property>, Vec<String>), Box<dyn std::error::Error>> {
+    let infos: Vec<&PlyInfo> = inputs
+        .iter()
+        .flatten()
+        .chain(base)
+        .map(|i| &i.info)
+        .collect();
+    common_layout(&infos).map_err(|e| e.into())
+}
+
+/// The first non-empty source's raw header (the output header template).
+fn first_raw_header(inputs: &[Option<Input>], base: Option<&Input>) -> Option<String> {
+    inputs
+        .iter()
+        .flatten()
+        .chain(base)
+        .next()
+        .map(|i| i.info.raw_header.clone())
 }
 
 /// The two alternating temp-file paths used by the voxel chain, beside the output.
@@ -169,7 +169,8 @@ fn output_is_the_log(output: &str, log: &Path) -> bool {
 
 /// Copies a single input to `out` verbatim (passthrough), count unchanged.
 fn passthrough(inp: &Input, out: &mut impl Write) -> Result<usize, Box<dyn std::error::Error>> {
-    rewrite_header(out, &inp.info.raw_header, inp.info.vertex_count)?;
+    // Passthrough: keep every header line verbatim (`keep = None`).
+    rewrite_header(out, &inp.info.raw_header, inp.info.vertex_count, None)?;
     out.write_all(&inp.mmap[inp.info.header_len..])?;
     Ok(inp.info.vertex_count)
 }
@@ -326,8 +327,15 @@ fn run_steps(
         }
     }
 
-    // 3. Shared stride and header template (errors on mismatch / all '-').
-    let header = header_template(&inputs, base.as_ref())?;
+    // 3. Common layout across all non-empty sources (errors when all are
+    //    '-', a source does not start with x, y, z, or a shared property
+    //    has a conflicting PLY type — see "Pipeline" — Errors).
+    let (common, dropped) = common_layout_of(&inputs, base.as_ref())?;
+    // Unreachable unless the all-'-' case slipped through common_layout;
+    // kept defensive rather than using unwrap().
+    let header = first_raw_header(&inputs, base.as_ref()).ok_or_else(|| {
+        error_msg("All data sources are '-' (empty); provide at least one real PLY file")
+    })?;
 
     // The voxel step only runs with 2+ inputs and needs at least one
     // enabled axis (set via the GUI checkboxes; the CLI always has all).
@@ -335,6 +343,16 @@ fn run_steps(
         return Err(error_msg(
             "No voxel axis enabled (at least one of X, Y, Z required)",
         ));
+    }
+
+    // One sink-only notification (never the run log) when properties are
+    // dropped, before any progress line (see "Pipeline" — Errors).
+    if !dropped.is_empty() {
+        let _ = writeln!(
+            prog,
+            "Dropped properties not present in every file: {}",
+            dropped.join(", ")
+        );
     }
 
     let (temp1, temp2) = temp_paths(&args.output)?;
@@ -354,6 +372,7 @@ fn run_steps(
                 args.voxel_size,
                 args.voxel_axes,
                 &header,
+                &common,
                 &mut temp_writer,
                 prog,
                 log,
@@ -375,6 +394,7 @@ fn run_steps(
                 Some((&base.mmap[..], &base.info)),
                 args.threshold,
                 &header,
+                &common,
                 &mut writer,
                 prog,
                 log,
@@ -386,6 +406,7 @@ fn run_steps(
                 args.voxel_size,
                 args.voxel_axes,
                 &header,
+                &common,
                 &mut writer,
                 prog,
                 log,
@@ -412,6 +433,7 @@ fn run_steps(
                 Some((&base.mmap[..], &base.info)),
                 args.threshold,
                 &header,
+                &common,
                 &mut writer,
                 prog,
                 log,
@@ -491,17 +513,59 @@ mod tests {
 
     /// Write a synthetic PLY with the given records; returns its path as a String.
     fn write_ply(dir: &TmpDir, name: &str, recs: &[Vec<u8>]) -> String {
+        write_ply_props(dir, name, PROPS, recs)
+    }
+
+    /// As `write_ply`, but with a caller-supplied `props` block
+    /// (mixed-layout tests).
+    fn write_ply_props(dir: &TmpDir, name: &str, props: &str, recs: &[Vec<u8>]) -> String {
         let body: Vec<u8> = recs.iter().flatten().copied().collect();
         let mut buf = format!(
             "ply\nformat binary_little_endian 1.0\nelement vertex {}\n{}end_header\n",
             recs.len(),
-            PROPS
+            props
         )
         .into_bytes();
         buf.extend_from_slice(&body);
         let p = dir.path(name);
         std::fs::write(&p, buf).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    /// One 4-float record: x, y, z and one more value (in the caller's order).
+    fn rec4(x: f32, y: f32, z: f32, w: f32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(16);
+        for v in [x, y, z, w] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    /// One 5-float record: x, y, z and two more values (in the caller's order).
+    fn rec5(x: f32, y: f32, z: f32, w: f32, s0: f32) -> Vec<u8> {
+        let mut b = Vec::with_capacity(20);
+        for v in [x, y, z, w, s0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+
+    /// One 6-float record: x, y, z and three more values (in the caller's order).
+    fn rec6(x: f32, y: f32, z: f32, a: f32, b: f32, c: f32) -> Vec<u8> {
+        let mut v = vec![];
+        for f in [x, y, z, a, b, c] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
+    }
+
+    /// One 7-float record: x, y, z and four more values (in the caller's order).
+    fn rec7(x: f32, y: f32, z: f32, a: f32, b: f32, c: f32, d: f32) -> Vec<u8> {
+        let mut v = vec![];
+        for f in [x, y, z, a, b, c, d] {
+            v.extend_from_slice(&f.to_le_bytes());
+        }
+        v
     }
 
     /// Args for tests; the threshold is `e` so the log-scale 1.0 boundary is exact.
@@ -686,33 +750,225 @@ mod tests {
     }
 
     #[test]
-    fn stride_mismatch_errors() {
+    fn mixed_layout_outputs_common_properties_and_notifies() {
         let _lock = shared_log_lock();
-        let dir = TmpDir::new("stride");
-        let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.1)]); // stride 44
-                                                                         // 8-float records -> stride 32.
-        let mut body = Vec::new();
-        for _ in 0..8 {
-            body.extend_from_slice(&1f32.to_le_bytes());
-        }
-        let mut b = "ply\nformat binary_little_endian 1.0\nelement vertex 1\n\
-            property float x\nproperty float y\nproperty float z\nproperty float opacity\n\
-            property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n\
-            end_header\n"
-            .as_bytes()
-            .to_vec();
-        b.extend_from_slice(&body);
-        let p = dir.path("b8.ply");
-        std::fs::write(&p, b).unwrap();
-        let bs = p.to_string_lossy().into_owned();
+        let dir = TmpDir::new("mixed");
+        // a: x, y, z, opacity, scale_0 (20B records); b: x, y, z, scale_0
+        // (16B). `opacity` is dropped; b's two splats share voxel (0,0,0)
+        // and win 2:1, and b's layout already equals the common one, so the
+        // output body is b's records byte-identical.
+        const PROPS_A: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float opacity\nproperty float scale_0\n";
+        const PROPS_B: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float scale_0\n";
+        let a = write_ply_props(&dir, "a.ply", PROPS_A, &[rec5(0.0, 0.0, 0.0, 0.1, 1.0)]);
+        let b = write_ply_props(
+            &dir,
+            "b.ply",
+            PROPS_B,
+            &[rec4(0.1, 0.1, 0.1, 2.0), rec4(0.2, 0.0, 0.0, 3.0)],
+        );
         let out = dir.path("out.ply");
-        assert!(run(&args(&format!("{},{}", a, bs), None, &out)).is_err());
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(
+            &args(&format!("{},{}", a, b), None, &out),
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let i = parse_ply_header(&data);
+        assert_eq!(i.vertex_count, 2);
+        assert_eq!(i.stride, 16);
+        assert_eq!(
+            i.properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y", "z", "scale_0"]
+        );
+        // The body is b's records, byte-identical (identity remap).
+        let mut expected = Vec::new();
+        for v in [0.1f32, 0.1, 0.1, 2.0, 0.2, 0.0, 0.0, 3.0] {
+            expected.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(body_of(&data), expected.as_slice());
+        // Exactly one sink-only notification, before the `Success:` line.
+        let sink_str = String::from_utf8(sink).unwrap();
+        let note = "Dropped properties not present in every file: opacity";
+        assert_eq!(sink_str.matches(note).count(), 1);
+        assert!(sink_str.find(note).unwrap() < sink_str.find("Success:").unwrap());
+        // The notification is never written to the run log.
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(!rlog.contains("Dropped properties"));
+        assert!(rlog.contains("Run finished"));
+    }
+
+    #[test]
+    fn conflicting_property_type_errors() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("conflict");
+        // Both files declare `opacity`, with different PLY types.
+        const PROPS_A: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float opacity\n";
+        const PROPS_B: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property uchar opacity\n";
+        let a = write_ply_props(&dir, "a.ply", PROPS_A, &[rec4(0.0, 0.0, 0.0, 0.1)]);
+        // b's record: three floats plus one uchar byte.
+        let mut bbody = Vec::new();
+        for v in [0.1f32, 0.2, 0.3] {
+            bbody.extend_from_slice(&v.to_le_bytes());
+        }
+        bbody.push(200u8);
+        let bs = write_ply_props(&dir, "b.ply", PROPS_B, std::slice::from_ref(&bbody));
+        let out = dir.path("out.ply");
+        let mut sink = Vec::new();
+        let err = run_with(
+            &args(&format!("{},{}", a, bs), None, &out),
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Property 'opacity' has conflicting PLY types between files (float vs uchar)"
+        );
         assert!(!out.exists());
         // The run log is kept, with the terminal failure line.
         let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
         assert!(rlog.contains("Run failed after"));
-        assert!(rlog.contains("Stride mismatch between input files (different property layouts)"));
+        assert!(rlog.contains(
+            "Property 'opacity' has conflicting PLY types between files (float vs uchar)"
+        ));
         assert!(!rlog.contains("Run finished"));
+    }
+
+    #[test]
+    fn property_order_must_be_xyz_errors() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("order");
+        // b declares `opacity` before `x` -> rejected before the run.
+        const PROPS_A: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float opacity\n";
+        const PROPS_B: &str = "property float opacity\nproperty float x\nproperty float y\n\
+                              property float z\n";
+        let a = write_ply_props(&dir, "a.ply", PROPS_A, &[rec4(0.0, 0.0, 0.0, 0.1)]);
+        let b = write_ply_props(&dir, "b.ply", PROPS_B, &[rec4(1.0, 1.0, 1.0, 0.2)]);
+        let out = dir.path("out.ply");
+        let mut sink = Vec::new();
+        let err = run_with(
+            &args(&format!("{},{}", a, b), None, &out),
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Every file must declare x, y, z as the first three properties"
+        );
+        assert!(!out.exists());
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Run failed after"));
+        assert!(rlog.contains("Every file must declare x, y, z as the first three properties"));
+        assert!(!rlog.contains("Run finished"));
+    }
+
+    #[test]
+    fn base_property_dropped_from_output() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("base-drop");
+        // a: x, y, z, detail, scale_0..2 (28B); base: x, y, z, scale_0..2
+        // (24B). `detail` drops out of the common layout. The scale step
+        // keeps a (max scale below the threshold) and the base (above it);
+        // a's record must be remapped onto the common layout.
+        const PROPS_A: &str = "property float x\nproperty float y\nproperty float z\n\
+                              property float detail\nproperty float scale_0\n\
+                              property float scale_1\nproperty float scale_2\n";
+        const PROPS_BASE: &str = "property float x\nproperty float y\nproperty float z\n\
+                                 property float scale_0\nproperty float scale_1\n\
+                                 property float scale_2\n";
+        let a = write_ply_props(
+            &dir,
+            "a.ply",
+            PROPS_A,
+            &[rec7(0.0, 0.0, 0.0, 0.25, 0.9, 0.9, 0.9)],
+        );
+        let base = write_ply_props(
+            &dir,
+            "base.ply",
+            PROPS_BASE,
+            &[rec6(2.0, 2.0, 2.0, 1.6, 1.6, 1.6)],
+        );
+        let out = dir.path("out.ply");
+        let mut sink: Vec<u8> = Vec::new();
+        run_with(&args(&a, Some(&base), &out), &mut sink, &NEVER).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        let i = parse_ply_header(&data);
+        assert_eq!(i.vertex_count, 2);
+        assert_eq!(i.stride, 24);
+        assert_eq!(
+            i.properties
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["x", "y", "z", "scale_0", "scale_1", "scale_2"]
+        );
+        let mut expected = Vec::new();
+        for v in [
+            0.0f32, 0.0, 0.0, 0.9, 0.9, 0.9, 2.0, 2.0, 2.0, 1.6, 1.6, 1.6,
+        ] {
+            expected.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(body_of(&data), expected.as_slice());
+        let sink_str = String::from_utf8(sink).unwrap();
+        let note = "Dropped properties not present in every file: detail";
+        assert_eq!(sink_str.matches(note).count(), 1);
+        assert!(sink_str.find(note).unwrap() < sink_str.find("Success:").unwrap());
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(!rlog.contains("Dropped properties"));
+        assert!(rlog.contains("Run finished"));
+    }
+
+    #[test]
+    fn base_drops_scale_property_errors_and_removes_temps() {
+        let _lock = shared_log_lock();
+        let dir = TmpDir::new("base-noscale");
+        // a, b: 11 floats (PROPS, with scale_0..2); base: 8 floats without
+        // any scale property. The common layout therefore drops scale_0..2,
+        // so the scale step must fail with the documented error and the
+        // temp files must still be removed.
+        let a = write_ply(&dir, "a.ply", &[record(0.0, 0.0, 0.0, 0.5)]);
+        let b = write_ply(&dir, "b.ply", &[record(5.0, 5.0, 5.0, 0.8)]);
+        const PROPS8: &str = "property float x\nproperty float y\nproperty float z\n\
+                             property float opacity\nproperty float rot_0\n\
+                             property float rot_1\nproperty float rot_2\n\
+                             property float rot_3\n";
+        let mut body8 = Vec::new();
+        for _ in 0..8 {
+            body8.extend_from_slice(&1f32.to_le_bytes());
+        }
+        let base = write_ply_props(&dir, "base8.ply", PROPS8, std::slice::from_ref(&body8));
+        let out = dir.path("merged.ply");
+        let mut sink: Vec<u8> = Vec::new();
+        let err = run_with(
+            &args(&format!("{},{}", a, b), Some(&base), &out),
+            &mut sink,
+            &NEVER,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "No scale in Input 1");
+        assert!(!dir.path("merged.temp1.ply").exists());
+        assert!(!dir.path("merged.temp2.ply").exists());
+        // The sink-only notification names all three dropped scale props,
+        // before any progress line.
+        let sink_str = String::from_utf8(sink).unwrap();
+        let note = "Dropped properties not present in every file: scale_0, scale_1, scale_2";
+        assert_eq!(sink_str.matches(note).count(), 1);
+        assert!(sink_str.find(note).unwrap() < sink_str.find("1 Mapping").unwrap());
+        let rlog = std::fs::read_to_string(exe_log_path()).unwrap();
+        assert!(rlog.contains("Run failed after"));
+        assert!(rlog.contains("No scale in Input 1"));
+        assert!(!rlog.contains("Dropped properties"));
     }
 
     #[test]
@@ -969,6 +1225,8 @@ mod tests {
             &NEVER,
         )
         .unwrap();
+        // Equal layouts -> no dropped-property notification at all.
+        assert!(!String::from_utf8_lossy(&sink).contains("Dropped properties"));
         assert_eq!(
             parse_ply_header(&std::fs::read(&out).unwrap()).vertex_count,
             4

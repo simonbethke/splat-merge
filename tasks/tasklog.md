@@ -4,6 +4,8 @@ Log of the task queue. Tasks are implemented **sequentially** in the order below
 For every finished task: fill in the date and time below and remove the task file
 from `tasks/`. Rules and workflow: see `AGENTS.md`; project facts: `docs/documentation.md`.
 
+## Pending
+
 ## Removed
 
 - 4) Load Camera Poses and Project Archiving (.smp)
@@ -28,3 +30,9 @@ from `tasks/`. Rules and workflow: see `AGENTS.md`; project facts: `docs/documen
 - File: `tasks/05-debug-render.md` (deleted)
 - Finished: 2026-10-26 21:00 (code done, docs in sync, clippy/tests/fmt clean,
   GUI verification: `screenshot.jpg` compared against the docs "GUI" section)
+
+### 6) Merge files with differing property layouts
+- File: `tasks/06-merge-mixed-property-layouts.md` (deleted)
+- Finished: 2026-10-27 09:15 (code done, docs in sync, clippy/tests/fmt clean,
+  75/75 tests, GUI verification: `screenshot.jpg` compared against the docs
+  "GUI" section)
